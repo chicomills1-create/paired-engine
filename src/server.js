@@ -6,7 +6,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { pathToFileURL } from 'node:url';
 import { getPool, dbUp } from './db.js';
-import { registerClerkWebhook } from './inbox.js';
+import { registerClerkWebhook, processInbox } from './inbox.js';
 import { registerMeRoutes } from './routes/me.js';
 import { registerFoundingRoutes } from './routes/founding.js';
 import { getStripe } from './stripe.js';
@@ -88,4 +88,24 @@ if (isMain) {
     app.log.error(err);
     process.exit(1);
   }
+  // In-process inbox drain: the single-service deploy runs the worker loop
+  // here so webhook events are applied without a second process.
+  // src/worker.js remains the split-out entrypoint for when scale needs it.
+  const pool = getPool();
+  const drainMs = Number(process.env.WORKER_INTERVAL_MS || 5000);
+  let draining = false;
+  setInterval(async () => {
+    if (draining) return;
+    draining = true;
+    try {
+      const { processed, failed } = await processInbox(pool);
+      if (processed || failed) {
+        app.log.info({ processed, failed }, 'inbox drain');
+      }
+    } catch (err) {
+      app.log.error({ err }, 'inbox drain error');
+    } finally {
+      draining = false;
+    }
+  }, drainMs);
 }
