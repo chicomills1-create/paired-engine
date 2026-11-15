@@ -6,12 +6,14 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { pathToFileURL } from 'node:url';
 import { getPool, dbUp } from './db.js';
-import { registerClerkWebhook, processInbox } from './inbox.js';
+import { registerClerkWebhook, registerStripeWebhook, processInbox } from './inbox.js';
 import { registerMeRoutes } from './routes/me.js';
 import { registerFoundingRoutes } from './routes/founding.js';
 import { registerArtistRoutes } from './routes/artist.js';
 import { registerListingsRoutes } from './routes/listings.js';
 import { registerUploadsRoutes } from './routes/uploads.js';
+import { registerOrdersRoutes } from './routes/orders.js';
+import { runCommerceSweeps } from './lib/release.js';
 import { getStripe } from './stripe.js';
 import { getS3Config } from './lib/storage.js';
 
@@ -62,13 +64,14 @@ export function buildServer() {
     return { ok: true, db: 'up' };
   });
 
-  // Clerk webhooks need the RAW body for signature verification, so they
-  // live in an encapsulated scope with a string JSON parser.
+  // Clerk + Stripe webhooks need the RAW body for signature verification,
+  // so they live in an encapsulated scope with a string JSON parser.
   app.register(async (scope) => {
     scope.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
       done(null, body);
     });
     registerClerkWebhook(scope, pool);
+    registerStripeWebhook(scope, pool);
   });
 
   registerMeRoutes(app, pool);
@@ -76,6 +79,7 @@ export function buildServer() {
   registerArtistRoutes(app, pool);
   registerListingsRoutes(app, pool);
   registerUploadsRoutes(app, pool);
+  registerOrdersRoutes(app, pool);
 
   // Stripe is initialized lazily and guarded: identity legs boot without it.
   if (!getStripe()) {
@@ -111,6 +115,13 @@ if (isMain) {
       const { processed, failed } = await processInbox(pool);
       if (processed || failed) {
         app.log.info({ processed, failed }, 'inbox drain');
+      }
+      // Commerce sweeps ride the same loop: lapsed checkout reservations
+      // release their pieces, expired acceptance windows convert, and
+      // accepted orders attempt their release. All idempotent.
+      const sweeps = await runCommerceSweeps(pool, getStripe());
+      if (sweeps.expiredReservations || sweeps.windowsAccepted || sweeps.transfersCompleted) {
+        app.log.info(sweeps, 'commerce sweeps');
       }
     } catch (err) {
       app.log.error({ err }, 'inbox drain error');
