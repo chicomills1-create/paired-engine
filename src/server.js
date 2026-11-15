@@ -13,7 +13,12 @@ import { registerArtistRoutes } from './routes/artist.js';
 import { registerListingsRoutes } from './routes/listings.js';
 import { registerUploadsRoutes } from './routes/uploads.js';
 import { registerOrdersRoutes } from './routes/orders.js';
+import { registerBriefsRoutes } from './routes/briefs.js';
+import { registerStudioRoutes } from './routes/studio.js';
+import { registerRoomRoutes } from './routes/room.js';
+import { registerAdminRoutes } from './routes/admin.js';
 import { runCommerceSweeps } from './lib/release.js';
+import { runReconciliation } from './lib/reconcile.js';
 import { getStripe } from './stripe.js';
 import { getS3Config } from './lib/storage.js';
 
@@ -80,6 +85,10 @@ export function buildServer() {
   registerListingsRoutes(app, pool);
   registerUploadsRoutes(app, pool);
   registerOrdersRoutes(app, pool);
+  registerBriefsRoutes(app, pool);
+  registerStudioRoutes(app, pool);
+  registerRoomRoutes(app, pool);
+  registerAdminRoutes(app, pool);
 
   // Stripe is initialized lazily and guarded: identity legs boot without it.
   if (!getStripe()) {
@@ -129,4 +138,24 @@ if (isMain) {
       draining = false;
     }
   }, drainMs);
+
+  // Reconciliation (M6) rides a slower loop: Stripe ↔ ledger truth pass,
+  // discrepancies to the exception queue. Idempotent; a no-op that says
+  // so while Stripe is unconfigured.
+  const reconcileMs = Number(process.env.RECONCILE_INTERVAL_MS || 15 * 60 * 1000);
+  let reconciling = false;
+  setInterval(async () => {
+    if (reconciling) return;
+    reconciling = true;
+    try {
+      const result = await runReconciliation(pool, getStripe());
+      if (result.ran && (result.raised || result.payoutsAdvanced)) {
+        app.log.warn(result, 'reconciliation: discrepancies raised / payouts advanced');
+      }
+    } catch (err) {
+      app.log.error({ err }, 'reconciliation error');
+    } finally {
+      reconciling = false;
+    }
+  }, reconcileMs);
 }
