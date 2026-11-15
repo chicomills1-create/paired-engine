@@ -6,6 +6,8 @@
 // Duplicate deliveries are ignored at insert; out-of-order deliveries are
 // reconciled by the worker applying the latest known state.
 import { Webhook } from 'svix';
+import { constructStripeEvent } from './stripe.js';
+import { applyStripeEvent } from './lib/stripeEvents.js';
 
 /**
  * Register POST /webhooks/clerk on an encapsulated Fastify scope whose JSON
@@ -40,6 +42,39 @@ export function registerClerkWebhook(scope, pool) {
       [eventId, event.type, JSON.stringify(event)],
     );
     // Fast 200 either way: a duplicate is a success, not an error.
+    return reply.code(200).send({ received: true, duplicate: rows.length === 0 });
+  });
+}
+
+/**
+ * Register POST /webhooks/stripe on the same raw-body scope as the Clerk
+ * webhook. Same pattern: signature verification → durable inbox row →
+ * fast 200; the worker applies the money state idempotently. A duplicate
+ * delivery is a success, not an error.
+ */
+export function registerStripeWebhook(scope, pool) {
+  scope.post('/webhooks/stripe', async (req, reply) => {
+    if (!process.env.STRIPE_WEBHOOK_SECRET) {
+      req.log.error('STRIPE_WEBHOOK_SECRET is not set');
+      return reply.code(500).send({ error: { code: 'not_configured', message: 'Webhook secret missing' } });
+    }
+    const rawBody = typeof req.body === 'string' ? req.body : '';
+    let event;
+    try {
+      event = constructStripeEvent(rawBody, req.headers['stripe-signature']);
+    } catch {
+      return reply.code(400).send({ error: { code: 'bad_signature', message: 'Webhook signature verification failed' } });
+    }
+    if (!event || !event.id) {
+      return reply.code(400).send({ error: { code: 'bad_signature', message: 'Webhook signature verification failed' } });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO event_inbox (source, event_id, type, payload)
+       VALUES ('stripe', $1, $2, $3)
+       ON CONFLICT (event_id) DO NOTHING
+       RETURNING id`,
+      [event.id, event.type, JSON.stringify(event)],
+    );
     return reply.code(200).send({ received: true, duplicate: rows.length === 0 });
   });
 }
@@ -88,12 +123,13 @@ async function applyClerkEvent(client, event) {
 }
 
 /**
- * Apply pending Clerk events from the inbox, idempotently.
- * Each event is claimed with FOR UPDATE SKIP LOCKED inside its own
- * transaction; failures keep the row unprocessed with attempts/last_error
- * recorded, so a failed job never silently disappears.
- * (Stripe events stay queued for the M3 worker — money state is never
- * applied by a no-op.)
+ * Apply pending inbox events — Clerk identity events and Stripe money
+ * events — idempotently. Each event is claimed with FOR UPDATE SKIP
+ * LOCKED inside its own transaction and its effects commit together
+ * with the processed stamp; failures keep the row unprocessed with
+ * attempts/last_error recorded, so a failed job never silently
+ * disappears. Stripe handlers are state-guarded, so a redelivery of an
+ * already-applied event is a no-op, never a double effect.
  */
 export async function processInbox(pool, { limit = 25 } = {}) {
   const client = await pool.connect();
@@ -103,8 +139,8 @@ export async function processInbox(pool, { limit = 25 } = {}) {
     for (let i = 0; i < limit; i++) {
       await client.query('BEGIN');
       const { rows } = await client.query(
-        `SELECT id, type, payload FROM event_inbox
-          WHERE source = 'clerk' AND processed_at IS NULL
+        `SELECT id, source, type, payload FROM event_inbox
+          WHERE processed_at IS NULL
           ORDER BY received_at ASC
           LIMIT 1
           FOR UPDATE SKIP LOCKED`,
@@ -115,7 +151,11 @@ export async function processInbox(pool, { limit = 25 } = {}) {
       }
       const row = rows[0];
       try {
-        await applyClerkEvent(client, row.payload);
+        if (row.source === 'stripe') {
+          await applyStripeEvent(client, row.payload);
+        } else {
+          await applyClerkEvent(client, row.payload);
+        }
         await client.query(
           `UPDATE event_inbox
               SET processed_at = now(), attempts = attempts + 1, last_error = NULL
