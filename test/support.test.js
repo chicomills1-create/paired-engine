@@ -84,10 +84,19 @@ test('validation failures are 400 and store nothing', async () => {
 test('references are unique across many questions', async () => {
   const refs = new Set();
   for (let i = 0; i < 40; i += 1) {
-    const res = await ask({
-      name: `Asker ${i}`,
-      email: `asker${i}@example.com`,
-      question: `Question number ${i}?`,
+    // Each asker submits from their own source address — the ASK-01
+    // write quota is per source, and forty distinct people are not
+    // one flooder.
+    const res = await app.inject({
+      method: 'POST',
+      url: '/v1/support/ask',
+      remoteAddress: `203.0.113.${10 + i}`,
+      headers: { 'content-type': 'application/json' },
+      payload: {
+        name: `Asker ${i}`,
+        email: `asker${i}@example.com`,
+        question: `Question number ${i}?`,
+      },
     });
     assert.equal(res.statusCode, 201, res.body);
     refs.add(res.json().reference);
@@ -125,4 +134,108 @@ test('admin read can filter by status', async () => {
   });
   assert.equal(res.statusCode, 200);
   assert.equal(res.json().questions.length, 0);
+});
+
+// ---- ASK-01: abuse protection ----------------------------------------
+
+test('link-stuffed questions are rejected as spam and store nothing', async () => {
+  const before = (await pool.query('SELECT count(*)::int AS n FROM support_questions')).rows[0].n;
+  const stuffed = await ask({
+    name: 'Link Larry',
+    email: 'larry@example.com',
+    question: 'Deals! https://a.example.com http://b.example.com www.c.example.com https://d.example.com — act now',
+  });
+  assert.equal(stuffed.statusCode, 400, stuffed.body);
+  assert.equal(stuffed.json().error.code, 'too_many_links');
+
+  const urlName = await ask({
+    name: 'https://spam.example.com',
+    email: 'larry@example.com',
+    question: 'A perfectly ordinary question?',
+  });
+  assert.equal(urlName.statusCode, 400, urlName.body);
+  assert.equal(urlName.json().error.code, 'name_invalid');
+
+  // A couple of links inside a real question are fine — the rule is
+  // proportionate, not a blanket ban on links.
+  const legit = await ask({
+    name: 'Pat Painter',
+    email: 'pat@example.com',
+    question: 'My portfolio is at https://pat.example.com and my shop at https://shop.example.com — can I link both from my page?',
+  });
+  assert.equal(legit.statusCode, 201, legit.body);
+
+  const after = (await pool.query('SELECT count(*)::int AS n FROM support_questions')).rows[0].n;
+  assert.equal(after, before + 1, 'only the legitimate question was stored');
+});
+
+test('write quota: the 21st stored question from one source is 429; other sources are unaffected', async () => {
+  const from = (ip, i) => app.inject({
+    method: 'POST',
+    url: '/v1/support/ask',
+    remoteAddress: ip,
+    headers: { 'content-type': 'application/json' },
+    payload: {
+      name: 'Floody Fran',
+      email: 'fran@example.com',
+      question: `A distinct question, number ${i}?`,
+    },
+  });
+  for (let i = 0; i < 20; i += 1) {
+    const res = await from('198.51.100.7', i);
+    assert.equal(res.statusCode, 201, res.body);
+  }
+  const blocked = await from('198.51.100.7', 20);
+  assert.equal(blocked.statusCode, 429, blocked.body);
+  assert.equal(blocked.json().error.code, 'rate_limited');
+  assert.ok(Number(blocked.headers['retry-after']) > 0, 'a Retry-After is quoted');
+
+  const other = await from('198.51.100.8', 99);
+  assert.equal(other.statusCode, 201, other.body);
+});
+
+// ---- ASK-02: the reference is a receipt, not a capability ------------
+
+test('the reference is a receipt, not a lookup: no read path is keyed by it', async () => {
+  const res = await ask({
+    name: 'Receipt Ruth',
+    email: 'ruth@example.com',
+    question: 'Can anyone read this back with just my reference?',
+  });
+  assert.equal(res.statusCode, 201, res.body);
+  const { reference } = res.json();
+  for (const url of [`/v1/support/questions/${reference}`, `/v1/support/ask/${reference}`]) {
+    const probe = await call(app, { method: 'GET', url });
+    assert.equal(probe.statusCode, 404, `${url} must not exist`);
+  }
+});
+
+// ---- ASK-03: duplicate suppression -----------------------------------
+
+test('a client retry of the same question returns the original reference and stores one record', async () => {
+  const payload = {
+    name: 'Retry Rita',
+    email: 'rita@example.com',
+    question: 'Did my question about framing costs go through?',
+  };
+  const first = await ask(payload);
+  assert.equal(first.statusCode, 201, first.body);
+  const reference = first.json().reference;
+
+  const retry = await ask(payload);
+  assert.equal(retry.statusCode, 200, retry.body);
+  assert.equal(retry.json().reference, reference, 'the retry quotes the ORIGINAL reference');
+  assert.equal(retry.json().duplicate, true);
+
+  const { rows } = await pool.query(
+    'SELECT count(*)::int AS n FROM support_questions WHERE email = $1 AND question = $2',
+    [payload.email, payload.question],
+  );
+  assert.equal(rows[0].n, 1, 'the retry stored no second record');
+
+  // Suppression is scoped to the identical question — a different
+  // question from the same asker is a new record with a new reference.
+  const different = await ask({ ...payload, question: 'A different question entirely?' });
+  assert.equal(different.statusCode, 201, different.body);
+  assert.notEqual(different.json().reference, reference);
 });
