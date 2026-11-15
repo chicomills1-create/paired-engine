@@ -21,6 +21,25 @@ export const UPLOAD_CONTENT_TYPES = Object.freeze({
   'image/webp': 'webp',
 });
 
+// Audio masters (Sound plan §3: WAV/FLAC preferred, MP3 accepted).
+// Presign kinds keep the two allowlists separate so an image door can
+// never issue an audio key and vice versa.
+export const AUDIO_CONTENT_TYPES = Object.freeze({
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/flac': 'flac',
+  'audio/x-flac': 'flac',
+  'audio/mp4': 'm4a',
+  'audio/aac': 'aac',
+  'audio/ogg': 'ogg',
+});
+
+export const UPLOAD_KINDS = Object.freeze({
+  image: UPLOAD_CONTENT_TYPES,
+  audio: AUDIO_CONTENT_TYPES,
+});
+
 export const UPLOAD_EXPIRES_IN = 900; // 15 minutes to complete the PUT.
 export const DOWNLOAD_EXPIRES_IN = 3600; // 1 hour read URLs.
 
@@ -66,14 +85,20 @@ export function keyInNamespace(key, accountId) {
 
 /**
  * Issue a presigned PUT for a new media object owned by the account.
- * Returns { key, url, expiresIn } or null when storage is not configured.
- * Throws on a content type outside the allowlist.
+ * `kind` selects the allowlist ('image' by default — the M2 behavior;
+ * 'audio' for Sound masters). Returns { key, url, expiresIn } or null
+ * when storage is not configured. Throws on a content type outside the
+ * kind's allowlist.
  */
-export async function presignUpload({ accountId, contentType } = {}) {
-  const ext = UPLOAD_CONTENT_TYPES[contentType];
+export async function presignUpload({ accountId, contentType, kind = 'image' } = {}) {
+  const allowlist = UPLOAD_KINDS[kind];
+  if (!allowlist) {
+    throw new Error(`presignUpload: kind '${kind}' is not allowed (allowed: ${Object.keys(UPLOAD_KINDS).join(', ')})`);
+  }
+  const ext = allowlist[contentType];
   if (!ext) {
     throw new Error(
-      `presignUpload: content type '${contentType}' is not allowed (allowed: ${Object.keys(UPLOAD_CONTENT_TYPES).join(', ')})`,
+      `presignUpload: content type '${contentType}' is not allowed for kind '${kind}' (allowed: ${Object.keys(allowlist).join(', ')})`,
     );
   }
   const s3 = getS3();

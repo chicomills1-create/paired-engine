@@ -103,19 +103,59 @@ async function settlePayment(client, order, { paymentIntentId = null, chargeId =
       [order.id],
     );
     if (order.listing_id) {
-      const t = await transitionInventory(client, {
-        listingId: order.listing_id,
-        from: 'reserved',
-        to: 'sold',
-      });
-      if (!t.transitioned && t.currentState === 'available') {
-        // The hold lapsed before payment landed; the piece is still
-        // unsold, so the paid buyer takes it.
-        await transitionInventory(client, {
+      const { rows: lrows } = await client.query('SELECT medium FROM listings WHERE id = $1', [
+        order.listing_id,
+      ]);
+      const isMusic = lrows[0]?.medium === 'music';
+      if (!isMusic) {
+        const t = await transitionInventory(client, {
           listingId: order.listing_id,
-          from: 'available',
+          from: 'reserved',
           to: 'sold',
         });
+        if (!t.transitioned && t.currentState === 'available') {
+          // The hold lapsed before payment landed; the piece is still
+          // unsold, so the paid buyer takes it.
+          await transitionInventory(client, {
+            listingId: order.listing_id,
+            from: 'available',
+            to: 'sold',
+          });
+        }
+      } else {
+        // MUSIC: the release is not one-of-one — settlement never marks
+        // it sold, and delivery is instant by construction: the master
+        // files were attached to the listing before it could publish,
+        // so a settled payment IS the delivery event. The fulfillment
+        // moves to 'delivered' here (acceptance window starts), and
+        // the buyer's shelf unlocks from this order's payment record.
+        const due = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+        const { rows: frows } = await client.query(
+          `UPDATE fulfillments
+              SET state = 'delivered', delivered_at = now(), acceptance_due_at = $2,
+                  delivery_ref = $3,
+                  delivery_evidence = $4,
+                  updated_at = now()
+            WHERE order_id = $1 AND state = 'awaiting_delivery'
+            RETURNING id`,
+          [
+            order.id,
+            due,
+            `listing:${order.listing_id}`,
+            JSON.stringify({ type: 'file_delivery', ref: `listing:${order.listing_id}`, via: 'settlement' }),
+          ],
+        );
+        if (frows.length) {
+          await client.query(
+            `INSERT INTO fulfillment_events (fulfillment_id, event, actor_account_id, meta)
+             VALUES ($1, 'delivered', NULL, $2)`,
+            [frows[0].id, JSON.stringify({ via: 'settlement', kind: 'music' })],
+          );
+          await client.query(
+            `UPDATE orders SET status = 'delivered', updated_at = now() WHERE id = $1 AND status = 'paid'`,
+            [order.id],
+          );
+        }
       }
     }
   }
