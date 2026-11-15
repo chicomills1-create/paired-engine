@@ -125,7 +125,7 @@ export async function recheckBuyDoor(pool, { buyerId, listing }) {
 }
 
 /** The artist's server-side selling tier (Neon owns tier authority). */
-async function artistFeeTier(pool, artistId) {
+export async function artistFeeTier(pool, artistId) {
   const { rows } = await pool.query('SELECT tier FROM memberships WHERE account_id = $1', [
     artistId,
   ]);
