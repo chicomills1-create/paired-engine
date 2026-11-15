@@ -142,7 +142,8 @@ export function registerArtistRoutes(app, pool) {
   });
 
   // POST /v1/admin/verifications/decide — reviewer decision (admin only).
-  // Body: { verificationId, decision: 'under_review'|'verified'|'rejected', evidenceNotes? }
+  // Body: { verificationId, decision: 'under_review'|'verified'|'rejected', evidenceNotes }
+  // evidenceNotes are REQUIRED (M5 admin law) — they are the audit reason.
   // The verified flag is recomputed from the request records inside the
   // same transaction, and the decision writes an audit_log row (M0).
   app.post(
@@ -180,6 +181,19 @@ export function registerArtistRoutes(app, pool) {
           await client.query('ROLLBACK');
           return reply.code(409).send({
             error: { code: 'already_decided', message: `Verification request is already ${request.state}` },
+          });
+        }
+        // Admin law (M5): a decision without evidence notes is not a
+        // decision — the notes ARE the audit reason. Checked after the
+        // state gates so an already-decided request still answers 409.
+        const notesText = typeof evidenceNotes === 'string' ? evidenceNotes.trim() : '';
+        if (!notesText) {
+          await client.query('ROLLBACK');
+          return reply.code(400).send({
+            error: {
+              code: 'reason_required',
+              message: 'evidenceNotes are required for a verification decision (they are written to the audit log)',
+            },
           });
         }
         const terminal = decision === 'verified' || decision === 'rejected';

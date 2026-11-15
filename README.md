@@ -104,6 +104,31 @@ Granting the first admin: insert the role row directly in Neon for the
 founder's account (`INSERT INTO account_roles VALUES (<account_id>, 'admin')`)
 — there is deliberately no API for self-granting admin.
 
+## Routes (M4–M6)
+
+| Route | Auth | Purpose |
+|---|---|---|
+| `POST /v1/briefs` · `GET /v1/briefs` · `GET /v1/briefs/:id` · `POST /v1/briefs/:id/cancel` | Bearer (board reads public/soft) | commission briefs with real budgets |
+| `POST /v1/briefs/:id/pitches` · `GET /v1/briefs/:id/pitches` · `POST /v1/pitches/:id/accept` · `/reject` · `/withdraw` | Bearer | artist pitches; accept creates the commission order through the M3 machinery (fail-closed without Stripe) |
+| `POST/DELETE /v1/listings/:id/save` · `POST /v1/listings/:id/view` · `POST/DELETE /v1/artists/:accountId/follow` | Bearer | saves, view events, follows |
+| `GET /v1/studio/seller` · `GET /v1/studio/buyer` | Bearer | both Studio faces — every value traced to a server record; transfer_state ≠ payout_state |
+| `POST /v1/room/posts` · `GET /v1/room/posts` · `GET /v1/room/posts/:id` | Bearer | Common Room posts + one-level threads |
+| `POST /v1/room/reports` · `POST /v1/room/blocks` · `DELETE /v1/room/blocks/:accountId` · `GET /v1/room/blocks` | Bearer | reports into the admin queue; blocks hide + sever replies |
+| `GET /v1/admin/verifications/queue` · `GET /v1/admin/founding/applications` · `GET /v1/admin/orders` | Bearer + `admin` | console reads (the queue never returns proof codes) |
+| `POST /v1/admin/reports/:id/decide` · `POST /v1/admin/room/posts/:id/moderate` | Bearer + `admin` | moderation decisions — reason required, audit-logged |
+| `GET /v1/admin/exceptions` · `POST /v1/admin/exceptions/:id/acknowledge` · `/resolve` | Bearer + `admin` | the reconciliation exception queue |
+
+Admin law (M5): every admin action requires a `reason` (400 without) and
+writes `audit_log` with actor + reason + timestamp. That rule now covers
+the founding decide and the verification decide (`evidenceNotes`) too.
+
+Ops scripts: `node scripts/reconcile.mjs` runs one Stripe ↔ ledger
+reconciliation pass on demand (the worker + API service also run it on
+`RECONCILE_INTERVAL_MS`, default 15 min; discrepancies land in
+`exception_queue`, dedupe-keyed and idempotent). `node
+scripts/restore-drill.mjs` executes the backup/restore rehearsal against
+throwaway PGlite databases and prints the per-table count record.
+
 ## Schema (0001_core)
 
 `accounts` (Clerk-linked, soft-delete via status) · `account_roles`

@@ -7,6 +7,12 @@ import { mock } from 'node:test';
 export const stripeState = {
   sessions: [],
   transfers: [],
+  // Reconciliation fixtures (M6): what the Stripe-side list endpoints
+  // report. Tests seed these directly; created transfers also land here
+  // so a release-then-reconcile flow sees its own transfer.
+  stripeTransfers: [],
+  stripeCharges: [],
+  stripePayoutsByAccount: {},
   failNextSessionCreate: false,
   failNextTransfer: false,
   sessionSeq: 0,
@@ -14,10 +20,24 @@ export const stripeState = {
   reset() {
     this.sessions = [];
     this.transfers = [];
+    this.stripeTransfers = [];
+    this.stripeCharges = [];
+    this.stripePayoutsByAccount = {};
     this.failNextSessionCreate = false;
     this.failNextTransfer = false;
   },
 };
+
+function listPage(items, params = {}) {
+  const limit = params.limit || 100;
+  let start = 0;
+  if (params.starting_after) {
+    const idx = items.findIndex((x) => x.id === params.starting_after);
+    start = idx >= 0 ? idx + 1 : items.length;
+  }
+  const data = items.slice(start, start + limit);
+  return { data, has_more: start + data.length < items.length };
+}
 
 class FakeStripe {
   constructor(key, opts) {
@@ -56,7 +76,26 @@ class FakeStripe {
       const n = ++stripeState.transferSeq;
       const transfer = { id: `tr_test_${n}`, status: 'pending', ...params };
       stripeState.transfers.push({ transfer, params, opts });
+      stripeState.stripeTransfers.push({
+        id: transfer.id,
+        amount: params.amount,
+        amount_reversed: 0,
+        destination: params.destination || null,
+        transfer_group: params.transfer_group || null,
+      });
       return transfer;
+    },
+    list: async (params) => listPage(stripeState.stripeTransfers, params),
+  };
+
+  charges = {
+    list: async (params) => listPage(stripeState.stripeCharges, params),
+  };
+
+  payouts = {
+    list: async (params, opts) => {
+      const account = opts?.stripeAccount || params?.stripeAccount || 'default';
+      return listPage(stripeState.stripePayoutsByAccount[account] || [], params);
     },
   };
 

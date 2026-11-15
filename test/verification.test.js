@@ -95,7 +95,7 @@ test('under_review then verified: the profile flag turns on, audit row written',
   const status = await call(app, { method: 'GET', url: '/v1/artist/verification', as: 'alice' });
   const id = status.json().verification.id;
 
-  const review = await decide('admin1', id, 'under_review');
+  const review = await decide('admin1', id, 'under_review', 'Opened for review — shop reachable');
   assert.equal(review.statusCode, 200);
   assert.equal(review.json().verification.state, 'under_review');
   assert.equal(review.json().verified, false);
@@ -150,4 +150,23 @@ test('the artist can never set verified through the profile route', async () => 
   assert.equal(res.statusCode, 200);
   assert.equal(res.json().profile.verified, false);
   assert.equal(res.json().profile.displayName, 'Bob');
+});
+
+test('a decision without evidence notes is refused (M5 reason law)', async () => {
+  const sub = await submit('dave', 'https://example-etsy.test/dave', 'PAIRED-DV0001');
+  assert.equal(sub.statusCode, 201);
+  const id = sub.json().verification.id;
+
+  const noNotes = await decide('admin1', id, 'verified');
+  assert.equal(noNotes.statusCode, 400);
+  assert.equal(noNotes.json().error.code, 'reason_required');
+
+  const blankNotes = await decide('admin1', id, 'verified', '   ');
+  assert.equal(blankNotes.statusCode, 400);
+  assert.equal(blankNotes.json().error.code, 'reason_required');
+
+  // The request is untouched by the refused decisions.
+  const status = await call(app, { method: 'GET', url: '/v1/artist/verification', as: 'dave' });
+  assert.equal(status.json().verification.state, 'submitted');
+  assert.equal(status.json().verified, false);
 });
