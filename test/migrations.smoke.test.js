@@ -29,6 +29,12 @@ test('migrations apply and core tables exist', { skip: !url }, async () => {
       'jobs',
       'audit_log',
       'schema_migrations',
+      // M2 (0002_artists_listings)
+      'artist_profiles',
+      'verification_requests',
+      'listings',
+      'listing_media',
+      'connect_onboarding',
     ]) {
       assert.ok(tables.includes(expected), `missing table: ${expected}`);
     }
