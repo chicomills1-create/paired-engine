@@ -9,6 +9,7 @@
 // transitions in src/lib/inventory.js (checkout lands in M3).
 import { requireAuth, resolveOrCreateAccount, verifySessionToken } from '../auth.js';
 import { keyInNamespace, presignDownload } from '../lib/storage.js';
+import { recordListingView } from '../lib/views.js';
 
 const LISTING_TYPES = ['physical', 'digital'];
 const LISTING_STATUSES = ['draft', 'published', 'archived'];
@@ -24,8 +25,9 @@ function notFound(reply) {
 /**
  * Soft auth for public reads: resolve the caller when a valid token is
  * present, otherwise treat the request as anonymous. Never rejects.
+ * Shared: listings use it for public reads, briefs for board reads.
  */
-function optionalAuth(pool) {
+export function optionalAuth(pool) {
   return async function optionalAuthPreHandler(req) {
     req.account = null;
     const header = req.headers.authorization || '';
@@ -63,7 +65,7 @@ async function mediaForListing(pool, listingId) {
   return media;
 }
 
-async function listingView(pool, row) {
+export async function listingView(pool, row) {
   return {
     id: row.id,
     accountId: row.account_id,
@@ -135,11 +137,16 @@ export function registerListingsRoutes(app, pool) {
   });
 
   // GET /v1/listings/:id — public when published; the owner always.
+  // Reading a published piece records a view event (M4): the Studio's
+  // views count traces to listing_views rows (src/lib/views.js).
   app.get('/v1/listings/:id', { preHandler: softAuth }, async (req, reply) => {
     const listing = await getListing(pool, req.params.id);
     if (!listing) return notFound(reply);
     const isOwner = req.account && req.account.id === listing.account_id;
     if (listing.status !== 'published' && !isOwner) return notFound(reply);
+    if (listing.status === 'published') {
+      await recordListingView(pool, listing, req.account?.id || null).catch(() => {});
+    }
     return { listing: await listingView(pool, listing) };
   });
 
