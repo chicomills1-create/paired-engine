@@ -9,7 +9,11 @@ import { getPool, dbUp } from './db.js';
 import { registerClerkWebhook, processInbox } from './inbox.js';
 import { registerMeRoutes } from './routes/me.js';
 import { registerFoundingRoutes } from './routes/founding.js';
+import { registerArtistRoutes } from './routes/artist.js';
+import { registerListingsRoutes } from './routes/listings.js';
+import { registerUploadsRoutes } from './routes/uploads.js';
 import { getStripe } from './stripe.js';
+import { getS3Config } from './lib/storage.js';
 
 const ALLOWED_ORIGINS = new Set([
   'https://pairedart.com',
@@ -69,10 +73,16 @@ export function buildServer() {
 
   registerMeRoutes(app, pool);
   registerFoundingRoutes(app, pool);
+  registerArtistRoutes(app, pool);
+  registerListingsRoutes(app, pool);
+  registerUploadsRoutes(app, pool);
 
   // Stripe is initialized lazily and guarded: identity legs boot without it.
   if (!getStripe()) {
     app.log.warn('STRIPE_SECRET_KEY not set — money legs are disabled (fail closed)');
+  }
+  if (!getS3Config()) {
+    app.log.warn('S3 storage not configured — upload legs are disabled (fail closed)');
   }
 
   return app;
