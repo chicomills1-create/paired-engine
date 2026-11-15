@@ -46,6 +46,7 @@ export async function buildTestApp(pool) {
   const { registerStudioRoutes } = await import('../../src/routes/studio.js');
   const { registerRoomRoutes } = await import('../../src/routes/room.js');
   const { registerAdminRoutes } = await import('../../src/routes/admin.js');
+  const { registerSoundRoutes } = await import('../../src/routes/sound.js');
   const { registerStripeWebhook } = await import('../../src/inbox.js');
   registerArtistRoutes(app, pool);
   registerListingsRoutes(app, pool);
@@ -57,6 +58,7 @@ export async function buildTestApp(pool) {
   registerStudioRoutes(app, pool);
   registerRoomRoutes(app, pool);
   registerAdminRoutes(app, pool);
+  registerSoundRoutes(app, pool);
   // Stripe webhooks verify against the RAW body — same encapsulated
   // string-parser scope as production (src/server.js).
   app.register(async (scope) => {
