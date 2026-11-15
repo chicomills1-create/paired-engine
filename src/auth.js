@@ -11,6 +11,35 @@ function unauthorized(reply, code = 'unauthorized', message = 'Authentication re
 }
 
 /**
+ * Verify a Clerk session token.
+ *
+ * LOCAL verification first when CLERK_JWT_KEY (the instance's JWKS public
+ * key, PEM) is configured — zero network, cannot stall. Otherwise, or if
+ * local verification fails (e.g. Clerk rotated its signing key), fall back
+ * to the secret-key path, TIME-BOXED: that path fetches remote key material
+ * with no built-in timeout, and on 2026-11-15 a stalled fetch hung every
+ * authenticated request on the production instance while /health and
+ * unauthenticated 401s stayed fast. A stall must become an error, never a
+ * hang.
+ */
+export async function verifySessionToken(token) {
+  const jwtKey = process.env.CLERK_JWT_KEY;
+  if (jwtKey) {
+    try {
+      return await verifyToken(token, { jwtKey });
+    } catch {
+      // Fall through to the network path (key rotation self-heal).
+    }
+  }
+  return await Promise.race([
+    verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('token verification timed out')), 8000),
+    ),
+  ]);
+}
+
+/**
  * Resolve the local account for a Clerk user id, creating it on first sight.
  * New accounts get the default 'buyer' role and a Solo membership row —
  * entitlements only ever change server-side (webhooks, admin actions).
@@ -79,7 +108,7 @@ export function requireAuth(pool) {
 
     let claims;
     try {
-      claims = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY });
+      claims = await verifySessionToken(token);
     } catch {
       return unauthorized(reply, 'invalid_token', 'Session token could not be verified');
     }
