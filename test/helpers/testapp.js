@@ -40,11 +40,23 @@ export async function buildTestApp(pool) {
   const { registerListingsRoutes } = await import('../../src/routes/listings.js');
   const { registerUploadsRoutes } = await import('../../src/routes/uploads.js');
   const { registerOrdersRoutes } = await import('../../src/routes/orders.js');
+  const { registerMeRoutes } = await import('../../src/routes/me.js');
+  const { registerFoundingRoutes } = await import('../../src/routes/founding.js');
+  const { registerBriefsRoutes } = await import('../../src/routes/briefs.js');
+  const { registerStudioRoutes } = await import('../../src/routes/studio.js');
+  const { registerRoomRoutes } = await import('../../src/routes/room.js');
+  const { registerAdminRoutes } = await import('../../src/routes/admin.js');
   const { registerStripeWebhook } = await import('../../src/inbox.js');
   registerArtistRoutes(app, pool);
   registerListingsRoutes(app, pool);
   registerUploadsRoutes(app, pool);
   registerOrdersRoutes(app, pool);
+  registerMeRoutes(app, pool);
+  registerFoundingRoutes(app, pool);
+  registerBriefsRoutes(app, pool);
+  registerStudioRoutes(app, pool);
+  registerRoomRoutes(app, pool);
+  registerAdminRoutes(app, pool);
   // Stripe webhooks verify against the RAW body — same encapsulated
   // string-parser scope as production (src/server.js).
   app.register(async (scope) => {
