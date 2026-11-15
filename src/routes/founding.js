@@ -57,7 +57,9 @@ export function registerFoundingRoutes(app, pool) {
   });
 
   // POST /v1/admin/founding/decide — admin only.
-  // Body: { applicationId, decision: 'approved'|'rejected', reason? }
+  // Body: { applicationId, decision: 'approved'|'rejected', reason }
+  // The reason is REQUIRED (M5 admin law): every admin action writes an
+  // audit_log row with actor + reason + timestamp — no reason, no action.
   app.post(
     '/v1/admin/founding/decide',
     { preHandler: [auth, requireRole('admin')] },
@@ -66,6 +68,15 @@ export function registerFoundingRoutes(app, pool) {
       if (!applicationId || !['approved', 'rejected'].includes(decision)) {
         return reply.code(400).send({
           error: { code: 'bad_request', message: "Body requires applicationId and decision ('approved'|'rejected')" },
+        });
+      }
+      const reasonText = typeof reason === 'string' ? reason.trim() : '';
+      if (!reasonText) {
+        return reply.code(400).send({
+          error: {
+            code: 'reason_required',
+            message: 'A reason is required for a founding decision (it is written to the audit log)',
+          },
         });
       }
       const client = await pool.connect();
@@ -142,7 +153,7 @@ export function registerFoundingRoutes(app, pool) {
           [
             req.account.id,
             `founding_application:${applicationId}`,
-            typeof reason === 'string' ? reason.slice(0, 1000) : null,
+            reasonText.slice(0, 1000),
             JSON.stringify({ decision, seatNo, applicantAccountId: application.account_id }),
           ],
         );
