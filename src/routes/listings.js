@@ -7,8 +7,7 @@
 //
 // Inventory state is NOT writable here: it moves only through the atomic
 // transitions in src/lib/inventory.js (checkout lands in M3).
-import { verifyToken } from '@clerk/backend';
-import { requireAuth, resolveOrCreateAccount } from '../auth.js';
+import { requireAuth, resolveOrCreateAccount, verifySessionToken } from '../auth.js';
 import { keyInNamespace, presignDownload } from '../lib/storage.js';
 
 const LISTING_TYPES = ['physical', 'digital'];
@@ -33,7 +32,7 @@ function optionalAuth(pool) {
     const token = header.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : null;
     if (!token) return;
     try {
-      const claims = await verifyToken(token, { secretKey: process.env.CLERK_SECRET_KEY });
+      const claims = await verifySessionToken(token);
       if (!claims?.sub) return;
       const account = await resolveOrCreateAccount(pool, claims.sub, claims.email || null);
       if (account.status === 'active') {
