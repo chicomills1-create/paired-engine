@@ -105,7 +105,7 @@ export function registerStudioRoutes(app, pool) {
     const listings = [];
     for (const l of listingRows) {
       listings.push({
-        ...(await listingView(pool, l)),
+        ...(await listingView(pool, l, me)),
         // Posted-where: a listing is public exactly when it is published
         // (the public reads serve published only) — stated from the record.
         postedWhere: l.status === 'published' ? 'public' : 'studio_only',
@@ -207,7 +207,7 @@ export function registerStudioRoutes(app, pool) {
     const saved = [];
     for (const l of savedRows) {
       saved.push({
-        ...(await listingView(pool, l)),
+        ...(await listingView(pool, l, me)),
         // A saved piece can leave the public shelf after the save; the
         // Studio says so from the record instead of pretending otherwise.
         currentlyPublic: l.status === 'published',
