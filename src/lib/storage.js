@@ -12,13 +12,32 @@
 // Signing is offline cryptography, so presigning works (and is tested)
 // without a reachable bucket.
 import { randomUUID } from 'node:crypto';
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 export const UPLOAD_CONTENT_TYPES = Object.freeze({
   'image/jpeg': 'jpg',
   'image/png': 'png',
   'image/webp': 'webp',
+});
+
+// Audio masters (Sound plan §3: WAV/FLAC preferred, MP3 accepted).
+// Presign kinds keep the two allowlists separate so an image door can
+// never issue an audio key and vice versa.
+export const AUDIO_CONTENT_TYPES = Object.freeze({
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
+  'audio/flac': 'flac',
+  'audio/x-flac': 'flac',
+  'audio/mp4': 'm4a',
+  'audio/aac': 'aac',
+  'audio/ogg': 'ogg',
+});
+
+export const UPLOAD_KINDS = Object.freeze({
+  image: UPLOAD_CONTENT_TYPES,
+  audio: AUDIO_CONTENT_TYPES,
 });
 
 export const UPLOAD_EXPIRES_IN = 900; // 15 minutes to complete the PUT.
@@ -66,14 +85,20 @@ export function keyInNamespace(key, accountId) {
 
 /**
  * Issue a presigned PUT for a new media object owned by the account.
- * Returns { key, url, expiresIn } or null when storage is not configured.
- * Throws on a content type outside the allowlist.
+ * `kind` selects the allowlist ('image' by default — the M2 behavior;
+ * 'audio' for Sound masters). Returns { key, url, expiresIn } or null
+ * when storage is not configured. Throws on a content type outside the
+ * kind's allowlist.
  */
-export async function presignUpload({ accountId, contentType } = {}) {
-  const ext = UPLOAD_CONTENT_TYPES[contentType];
+export async function presignUpload({ accountId, contentType, kind = 'image' } = {}) {
+  const allowlist = UPLOAD_KINDS[kind];
+  if (!allowlist) {
+    throw new Error(`presignUpload: kind '${kind}' is not allowed (allowed: ${Object.keys(UPLOAD_KINDS).join(', ')})`);
+  }
+  const ext = allowlist[contentType];
   if (!ext) {
     throw new Error(
-      `presignUpload: content type '${contentType}' is not allowed (allowed: ${Object.keys(UPLOAD_CONTENT_TYPES).join(', ')})`,
+      `presignUpload: content type '${contentType}' is not allowed for kind '${kind}' (allowed: ${Object.keys(allowlist).join(', ')})`,
     );
   }
   const s3 = getS3();
@@ -99,4 +124,49 @@ export async function presignDownload(key) {
     new GetObjectCommand({ Bucket: s3.config.bucket, Key: key }),
     { expiresIn: DOWNLOAD_EXPIRES_IN },
   );
+}
+
+// ---------------------------------------------------------------------------
+// Attach-time verification (SND-04): the size and content type the capacity
+// ledger trusts must come from the STORED OBJECT, never from the browser's
+// declaration. headObject reads the object's real metadata server-side.
+//
+// Returns { sizeBytes, contentType } (either may be null when a provider
+// omits it), or null when storage is not configured. A missing object
+// throws an error with code 'object_not_found'; transport/provider errors
+// propagate so the caller can fail closed.
+//
+// Test seam — same spirit as the Clerk/Stripe module stubs: tests may
+// install a probe replacing the network HEAD. Production never does.
+// ---------------------------------------------------------------------------
+let headObjectProbe = null;
+
+export function setHeadObjectProbe(fn) {
+  headObjectProbe = typeof fn === 'function' ? fn : null;
+}
+
+export async function headObject(key) {
+  if (headObjectProbe) return headObjectProbe(key);
+  const s3 = getS3();
+  if (!s3) return null;
+  try {
+    const res = await s3.client.send(
+      new HeadObjectCommand({ Bucket: s3.config.bucket, Key: key }),
+    );
+    return {
+      sizeBytes: Number.isInteger(res.ContentLength) ? res.ContentLength : null,
+      contentType: typeof res.ContentType === 'string' ? res.ContentType : null,
+    };
+  } catch (err) {
+    if (
+      err?.name === 'NotFound' ||
+      err?.name === 'NoSuchKey' ||
+      err?.$metadata?.httpStatusCode === 404
+    ) {
+      const notFound = new Error(`headObject: no object at key '${key}'`);
+      notFound.code = 'object_not_found';
+      throw notFound;
+    }
+    throw err;
+  }
 }

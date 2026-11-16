@@ -66,3 +66,43 @@ export function feeSnapshot({ tier, priceCents, entitledTier } = {}) {
     calcVersion: CALC_VERSION,
   };
 }
+
+// ---------------------------------------------------------------------------
+// MUSIC — 0% commission at EVERY tier, forever (PAIRED-SOUND-PLAN §1,
+// ruling (C) adopted 2026-10-31). The tier buys capacity and surface,
+// never a better cut — there is no cut. Card processing is absorbed by
+// the platform from membership revenue; it is never netted from the
+// artist's share and never added to the buyer's price, so the artist
+// share of a music order is exactly the listed price. The snapshot
+// records the artist's real tier (the capacity authority) with a 0 rate
+// under its own calc version, so a music order can never be mistaken
+// for a visual order that happened to round to zero.
+// ---------------------------------------------------------------------------
+export const MUSIC_CALC_VERSION = 'v1-music-0pct';
+
+export function musicFeeSnapshot({ tier, priceCents, entitledTier } = {}) {
+  if (!Number.isInteger(priceCents) || priceCents < 0) {
+    throw new Error('musicFeeSnapshot: priceCents must be a non-negative integer (cents)');
+  }
+  if (!tier) throw new Error('musicFeeSnapshot: tier is required (it is the capacity authority)');
+  return {
+    tier,
+    entitledTier: entitledTier || tier,
+    rateBps: 0,
+    priceCents,
+    artistShareCents: priceCents,
+    platformShareCents: 0,
+    calcVersion: MUSIC_CALC_VERSION,
+  };
+}
+
+/**
+ * The one fee entry point checkout uses: music listings snapshot at
+ * 0% (any tier — even a collector tier's stray music listing cannot be
+ * fee'd, and cannot throw the visual no-selling-rate error); every
+ * other listing snapshots under the visual tier rates.
+ */
+export function feeSnapshotForListing({ medium, tier, priceCents, entitledTier } = {}) {
+  if (medium === 'music') return musicFeeSnapshot({ tier, priceCents, entitledTier });
+  return feeSnapshot({ tier, priceCents, entitledTier });
+}

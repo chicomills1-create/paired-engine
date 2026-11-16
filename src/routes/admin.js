@@ -288,6 +288,124 @@ export function registerAdminRoutes(app, pool) {
     }
   });
 
+  // GET /v1/admin/listings/rights-holds — the Sound rights-review
+  // queue: music releases currently held for per-release rights review
+  // (SND-02), oldest first — the order a reviewer works them.
+  app.get('/v1/admin/listings/rights-holds', { preHandler: gate }, async () => {
+    const { rows } = await pool.query(
+      `SELECT l.id, l.account_id, l.title, l.status, l.content_kind,
+              l.rights_recording, l.rights_composition, l.rights_state,
+              l.updated_at, a.email, a.display_name
+         FROM listings l JOIN accounts a ON a.id = l.account_id
+        WHERE l.medium = 'music' AND l.rights_state = 'held_for_review'
+        ORDER BY l.updated_at ASC LIMIT 200`,
+    );
+    return {
+      holds: rows.map((r) => ({
+        id: r.id,
+        accountId: r.account_id,
+        email: r.email,
+        displayName: r.display_name,
+        title: r.title,
+        status: r.status,
+        contentKind: r.content_kind,
+        rightsRecording: r.rights_recording === true,
+        rightsComposition: r.rights_composition === true,
+        rightsState: r.rights_state,
+        updatedAt: r.updated_at,
+      })),
+    };
+  });
+
+  // POST /v1/admin/listings/:id/rights-review — the reviewer's two
+  // decisions on a music release's rights record, each with a reason:
+  //   clear — lift a review hold (rights_state → 'cleared'). Clearing
+  //           never publishes; the artist republishes through the
+  //           normal gate, which now passes for a cleared release.
+  //   hold  — open (or re-open) a review hold. This is also the rights
+  //           TAKEDOWN path (SND-05): a published release comes down
+  //           (status → draft) in the same act, and the buy-door
+  //           recheck refuses its sales while the hold stands.
+  app.post('/v1/admin/listings/:id/rights-review', { preHandler: gate }, async (req, reply) => {
+    const decision = req.body?.decision;
+    if (!['clear', 'hold'].includes(decision)) {
+      return reply.code(400).send({
+        error: { code: 'bad_request', message: "Body requires decision ('clear'|'hold')" },
+      });
+    }
+    const reason = requireReason(req, reply);
+    if (reason === null) return;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query('SELECT * FROM listings WHERE id = $1 FOR UPDATE', [
+        req.params.id,
+      ]);
+      if (!rows.length || rows[0].medium !== 'music') {
+        await client.query('ROLLBACK');
+        return reply.code(404).send({ error: { code: 'not_found', message: 'Release not found' } });
+      }
+      const listing = rows[0];
+      if (decision === 'clear' && listing.rights_state !== 'held_for_review') {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({
+          error: {
+            code: 'invalid_state',
+            message: `Only a held release can be cleared (this one is '${listing.rights_state}')`,
+          },
+        });
+      }
+      if (decision === 'hold' && listing.rights_state === 'held_for_review' && listing.status !== 'published') {
+        await client.query('ROLLBACK');
+        return reply.code(409).send({
+          error: { code: 'invalid_state', message: 'Release is already held for review' },
+        });
+      }
+      const wasPublished = listing.status === 'published';
+      const { rows: updated } = await client.query(
+        `UPDATE listings
+            SET rights_state = $1,
+                status = CASE WHEN $2 AND status = 'published' THEN 'draft' ELSE status END,
+                updated_at = now()
+          WHERE id = $3 RETURNING *`,
+        [decision === 'clear' ? 'cleared' : 'held_for_review', decision === 'hold', listing.id],
+      );
+      await audit(
+        client,
+        req.account.id,
+        decision === 'clear' ? 'listing.rights_clear' : 'listing.rights_hold',
+        `listing:${listing.id}`,
+        reason,
+        {
+          decision,
+          from: listing.rights_state,
+          to: updated[0].rights_state,
+          contentKind: listing.content_kind,
+          wasPublished,
+          unpublished: decision === 'hold' && wasPublished,
+          artistAccountId: listing.account_id,
+        },
+      );
+      await client.query('COMMIT');
+      const u = updated[0];
+      return {
+        listing: {
+          id: u.id,
+          accountId: u.account_id,
+          title: u.title,
+          status: u.status,
+          contentKind: u.content_kind,
+          rightsState: u.rights_state,
+        },
+      };
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  });
+
   // GET /v1/admin/exceptions — the reconciliation / money exception
   // queue (default: open). Written by the M6 reconciliation job and by
   // any leg that meets money it cannot reconcile.
