@@ -8,9 +8,15 @@
 // Inventory state is NOT writable here: it moves only through the atomic
 // transitions in src/lib/inventory.js (checkout lands in M3).
 import { requireAuth, resolveOrCreateAccount, verifySessionToken } from '../auth.js';
-import { keyInNamespace, presignDownload } from '../lib/storage.js';
+import {
+  keyInNamespace,
+  presignDownload,
+  getS3Config,
+  headObject,
+  UPLOAD_KINDS,
+} from '../lib/storage.js';
 import { recordListingView } from '../lib/views.js';
-import { musicPublishCheck } from '../lib/music.js';
+import { musicPublishCheck, musicRightsInForce } from '../lib/music.js';
 import { artistFeeTier } from '../lib/checkout.js';
 
 const LISTING_TYPES = ['physical', 'digital'];
@@ -192,25 +198,112 @@ function musicFields(body, base = {}) {
  * for music — the Sound gate (tracks, rights declaration, originals
  * hold, tier capacity, storage) evaluated by src/lib/music.js. A held
  * release has its rights_state persisted so the hold is a record, not
- * a toast. Returns an error message or null.
+ * a toast. `q` is any queryable (pool or transaction client) so the
+ * gate can run inside the publish transaction. Returns
+ * { problem, held } — problem is an error message or null.
  */
-async function publishGate(pool, listing) {
+async function publishGate(q, listing) {
   const problem = publishProblem(listing);
-  if (problem) return problem;
+  if (problem) return { problem, held: false };
   if (listing.medium === 'music') {
-    const { tier, entitledTier } = await artistFeeTier(pool, listing.account_id);
-    const check = await musicPublishCheck(pool, { listing, tier, entitledTier });
+    const { tier, entitledTier } = await artistFeeTier(q, listing.account_id);
+    const check = await musicPublishCheck(q, { listing, tier, entitledTier });
     if (!check.ok) {
       if (check.held) {
-        await pool.query(
+        await q.query(
           `UPDATE listings SET rights_state = 'held_for_review', updated_at = now() WHERE id = $1`,
           [listing.id],
         );
       }
-      return check.reasons[0];
+      return { problem: check.reasons[0], held: check.held === true };
     }
   }
-  return null;
+  return { problem: null, held: false };
+}
+
+/**
+ * Publish one listing, serialized per artist (SND-04): the artist's
+ * account row is locked for the duration, the listing is re-read under
+ * its own row lock, and the gate (whose capacity leg reads the artist's
+ * LIVE catalog) is evaluated inside the same transaction — so two
+ * publishes racing for the same artist cannot both pass a capacity cap
+ * on stale reads. A gate failure rolls back, except a rights HOLD,
+ * whose record commits (the hold is the outcome, not an error).
+ * Returns { listing } or { problem }.
+ */
+async function publishListing(pool, listingId) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const { rows: pre } = await client.query('SELECT account_id FROM listings WHERE id = $1', [
+      listingId,
+    ]);
+    if (!pre.length) {
+      await client.query('ROLLBACK');
+      return { problem: null, listing: null };
+    }
+    await client.query('SELECT id FROM accounts WHERE id = $1 FOR UPDATE', [pre[0].account_id]);
+    const { rows } = await client.query('SELECT * FROM listings WHERE id = $1 FOR UPDATE', [
+      listingId,
+    ]);
+    const listing = rows[0];
+    const gate = await publishGate(client, listing);
+    if (gate.problem) {
+      if (gate.held) await client.query('COMMIT');
+      else await client.query('ROLLBACK');
+      return { problem: gate.problem, listing: null };
+    }
+    const { rows: updated } = await client.query(
+      `UPDATE listings
+          SET status = 'published',
+              published_at = COALESCE(published_at, now()),
+              updated_at = now()
+        WHERE id = $1 RETURNING *`,
+      [listing.id],
+    );
+    await client.query('COMMIT');
+    return { problem: null, listing: updated[0] };
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * The rights record is preserved (SND-01): every declaration — at
+ * creation and at every later change — lands in the audit log with the
+ * artist as actor and the resulting review state, so the declaration's
+ * history (its versions, each timestamped) survives the listing row's
+ * current values.
+ */
+async function auditRightsDeclaration(q, { actorId, listing, action }) {
+  await q.query(
+    `INSERT INTO audit_log (actor_account_id, action, target, reason, meta)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [
+      actorId,
+      action,
+      `listing:${listing.id}`,
+      'per-release rights declaration (recording + composition)',
+      JSON.stringify({
+        rightsRecording: listing.rights_recording === true,
+        rightsComposition: listing.rights_composition === true,
+        contentKind: listing.content_kind || 'original',
+        rightsState: listing.rights_state || 'declared',
+      }),
+    ],
+  );
+}
+
+/** The music fields whose change re-opens the rights question. */
+function rightsFieldsTouched(before, next) {
+  return (
+    before.rights_recording !== next.rights_recording ||
+    before.rights_composition !== next.rights_composition ||
+    before.content_kind !== next.content_kind
+  );
 }
 
 export function registerListingsRoutes(app, pool) {
@@ -271,6 +364,13 @@ export function registerListingsRoutes(app, pool) {
        ON CONFLICT DO NOTHING`,
       [req.account.id],
     );
+    if (medium === 'music') {
+      await auditRightsDeclaration(pool, {
+        actorId: req.account.id,
+        listing: rows[0],
+        action: 'listing.rights_declaration',
+      });
+    }
     return reply.code(201).send({ listing: await listingView(pool, rows[0], req.account.id) });
   });
 
@@ -288,26 +388,24 @@ export function registerListingsRoutes(app, pool) {
     return { listing: await listingView(pool, listing, req.account?.id || null) };
   });
 
-  // PATCH /v1/listings/:id — owner-only field updates. Publishing through
-  // PATCH passes the same guards as the publish endpoint.
-  app.patch('/v1/listings/:id', { preHandler: auth }, async (req, reply) => {
-    const listing = await getListing(pool, req.params.id);
-    if (!listing || listing.account_id !== req.account.id) return notFound(reply);
-    const body = req.body || {};
-
+  // The field-application half of PATCH, shared by the plain path and
+  // the locked music-publish path so both compute `next` identically.
+  // Returns { next } or { error } (a 400 message). Status is applied but
+  // never gated here — gating is the caller's job.
+  function applyPatchFields(listing, body) {
     const next = { ...listing };
     if (typeof body.title === 'string') next.title = body.title.slice(0, 300);
     if (typeof body.description === 'string') next.description = body.description.slice(0, 5000);
     if (typeof body.category === 'string') next.category = body.category.slice(0, 120);
     if (body.priceCents !== undefined) {
       if (body.priceCents !== null && !validPrice(body.priceCents)) {
-        return badRequest(reply, 'priceCents must be a non-negative integer (cents)');
+        return { error: 'priceCents must be a non-negative integer (cents)' };
       }
       next.price_cents = body.priceCents;
     }
     if (body.type !== undefined) {
       if (!LISTING_TYPES.includes(body.type)) {
-        return badRequest(reply, `type must be one of: ${LISTING_TYPES.join(', ')}`);
+        return { error: `type must be one of: ${LISTING_TYPES.join(', ')}` };
       }
       next.type = body.type;
     }
@@ -315,29 +413,41 @@ export function registerListingsRoutes(app, pool) {
       // A music listing stays digital whatever the body claims.
       next.type = 'digital';
       const parsed = musicFields(body, listing);
-      if (parsed.error) return badRequest(reply, parsed.error);
+      if (parsed.error) return { error: parsed.error };
       Object.assign(next, parsed.fields);
     }
     if (body.status !== undefined) {
       if (!LISTING_STATUSES.includes(body.status)) {
-        return badRequest(reply, `status must be one of: ${LISTING_STATUSES.join(', ')}`);
-      }
-      if (body.status === 'published') {
-        const problem = await publishGate(pool, next);
-        if (problem) {
-          return reply.code(422).send({ error: { code: 'publish_guard', message: problem } });
-        }
+        return { error: `status must be one of: ${LISTING_STATUSES.join(', ')}` };
       }
       next.status = body.status;
     }
+    return { next };
+  }
 
-    const { rows } = await pool.query(
+  // Rights-state consequences of a patch (music only), computed before
+  // any write (SND-02): a CLEARED release whose declaration or content
+  // kind changes loses the clearance — review reopens (back to
+  // 'held_for_review' when the new kind is non-original, back to
+  // 'declared' when it is original). Returns { touched }.
+  function applyRightsSemantics(listing, next) {
+    if (listing.medium !== 'music') return { touched: false };
+    const touched = rightsFieldsTouched(listing, next);
+    if (touched && listing.rights_state === 'cleared') {
+      next.rights_state = next.content_kind !== 'original' ? 'held_for_review' : 'declared';
+    }
+    return { touched };
+  }
+
+  async function updateListingRow(q, listingId, next) {
+    const { rows } = await q.query(
       `UPDATE listings
           SET title = $1, description = $2, category = $3, price_cents = $4,
               type = $5, status = $6,
               release_type = $8, genre = $9, explicit = $10, release_date = $11,
               artist_credit = $12, content_kind = $13,
               rights_recording = $14, rights_composition = $15,
+              rights_state = $16,
               published_at = CASE
                 WHEN $6 = 'published' AND published_at IS NULL THEN now()
                 ELSE published_at
@@ -352,7 +462,7 @@ export function registerListingsRoutes(app, pool) {
         next.price_cents,
         next.type,
         next.status,
-        listing.id,
+        listingId,
         next.release_type ?? null,
         next.genre ?? null,
         next.explicit ?? false,
@@ -361,28 +471,139 @@ export function registerListingsRoutes(app, pool) {
         next.content_kind ?? 'original',
         next.rights_recording ?? false,
         next.rights_composition ?? false,
+        next.rights_state ?? 'declared',
       ],
     );
-    return { listing: await listingView(pool, rows[0], req.account.id) };
+    return rows[0];
+  }
+
+  // PATCH /v1/listings/:id — owner-only field updates. Publishing through
+  // PATCH passes the same guards as the publish endpoint.
+  app.patch('/v1/listings/:id', { preHandler: auth }, async (req, reply) => {
+    const listing = await getListing(pool, req.params.id);
+    if (!listing || listing.account_id !== req.account.id) return notFound(reply);
+    const body = req.body || {};
+
+    const applied = applyPatchFields(listing, body);
+    if (applied.error) return badRequest(reply, applied.error);
+    const next = applied.next;
+    const { touched } = applyRightsSemantics(listing, next);
+    const wantsPublish = body.status === 'published' && listing.status !== 'published';
+
+    if (wantsPublish && listing.medium === 'music') {
+      // Locked publish (SND-04): re-read and re-apply under the
+      // artist's account lock so the gate's capacity leg reads the
+      // live catalog, never a stale snapshot.
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query('SELECT id FROM accounts WHERE id = $1 FOR UPDATE', [
+          listing.account_id,
+        ]);
+        const { rows: freshRows } = await client.query(
+          'SELECT * FROM listings WHERE id = $1 FOR UPDATE',
+          [listing.id],
+        );
+        const fresh = freshRows[0];
+        if (!fresh || fresh.account_id !== req.account.id) {
+          await client.query('ROLLBACK');
+          return notFound(reply);
+        }
+        const reapplied = applyPatchFields(fresh, body);
+        if (reapplied.error) {
+          await client.query('ROLLBACK');
+          return badRequest(reply, reapplied.error);
+        }
+        const freshSem = applyRightsSemantics(fresh, reapplied.next);
+        const gate = await publishGate(client, reapplied.next);
+        if (gate.problem) {
+          if (gate.held) await client.query('COMMIT');
+          else await client.query('ROLLBACK');
+          return reply.code(422).send({ error: { code: 'publish_guard', message: gate.problem } });
+        }
+        const updated = await updateListingRow(client, listing.id, reapplied.next);
+        if (freshSem.touched) {
+          await auditRightsDeclaration(client, {
+            actorId: req.account.id,
+            listing: updated,
+            action: 'listing.rights_declaration',
+          });
+        }
+        await client.query('COMMIT');
+        return { listing: await listingView(pool, updated, req.account.id) };
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
+    }
+
+    if (wantsPublish) {
+      const gate = await publishGate(pool, next);
+      if (gate.problem) {
+        return reply.code(422).send({ error: { code: 'publish_guard', message: gate.problem } });
+      }
+    }
+
+    // A LIVE release whose rights stop being in force comes down in
+    // the same write (SND-01): the declaration change is recorded, the
+    // release returns to draft, and republication runs the full gate.
+    // A platform cannot keep selling on a declaration the artist has
+    // withdrawn, so the patch is never simply refused.
+    let unpublishReason = null;
+    if (
+      listing.medium === 'music' &&
+      listing.status === 'published' &&
+      next.status === 'published' &&
+      touched &&
+      !musicRightsInForce(next)
+    ) {
+      next.status = 'draft';
+      if (next.rights_recording === true && next.rights_composition === true) {
+        next.rights_state = 'held_for_review';
+        unpublishReason =
+          'rights review reopened by the declaration change — the release is held until a reviewer clears it';
+      } else {
+        unpublishReason =
+          'rights declaration withdrawn — a live release cannot stand on a withdrawn declaration';
+      }
+    }
+
+    const updated = await updateListingRow(pool, listing.id, next);
+    if (listing.medium === 'music' && touched) {
+      await auditRightsDeclaration(pool, {
+        actorId: req.account.id,
+        listing: updated,
+        action: 'listing.rights_declaration',
+      });
+      if (unpublishReason) {
+        await pool.query(
+          `INSERT INTO audit_log (actor_account_id, action, target, reason, meta)
+           VALUES ($1, 'listing.rights_gate_unpublish', $2, $3, $4)`,
+          [
+            req.account.id,
+            `listing:${listing.id}`,
+            unpublishReason,
+            JSON.stringify({ from: 'published', to: 'draft' }),
+          ],
+        );
+      }
+    }
+    return { listing: await listingView(pool, updated, req.account.id) };
   });
 
-  // POST /v1/listings/:id/publish — owner-only, guarded.
+  // POST /v1/listings/:id/publish — owner-only, guarded, and serialized
+  // per artist (publishListing) so capacity holds under concurrency.
   app.post('/v1/listings/:id/publish', { preHandler: auth }, async (req, reply) => {
     const listing = await getListing(pool, req.params.id);
     if (!listing || listing.account_id !== req.account.id) return notFound(reply);
-    const problem = await publishGate(pool, listing);
-    if (problem) {
-      return reply.code(422).send({ error: { code: 'publish_guard', message: problem } });
+    const result = await publishListing(pool, listing.id);
+    if (!result.listing) {
+      if (!result.problem) return notFound(reply);
+      return reply.code(422).send({ error: { code: 'publish_guard', message: result.problem } });
     }
-    const { rows } = await pool.query(
-      `UPDATE listings
-          SET status = 'published',
-              published_at = COALESCE(published_at, now()),
-              updated_at = now()
-        WHERE id = $1 RETURNING *`,
-      [listing.id],
-    );
-    return { listing: await listingView(pool, rows[0], req.account.id) };
+    return { listing: await listingView(pool, result.listing, req.account.id) };
   });
 
   // POST /v1/listings/:id/archive — owner-only.
@@ -437,8 +658,48 @@ export function registerListingsRoutes(app, pool) {
     const title = typeof body.title === 'string' ? body.title.slice(0, 300) : null;
     const durationSec =
       Number.isInteger(body.durationSec) && body.durationSec >= 0 ? body.durationSec : null;
-    const sizeBytes =
+    let sizeBytes =
       Number.isInteger(body.sizeBytes) && body.sizeBytes >= 0 ? body.sizeBytes : 0;
+    // SND-04: when storage is configured, the object itself is the
+    // authority — its real size (read server-side via HEAD) replaces
+    // the client's declared size in the capacity ledger, and its real
+    // content type must sit inside the kind's allowlist. An object that
+    // was never uploaded cannot be attached at all. When storage is
+    // NOT configured no upload could have happened through the presign
+    // door either; the declared size stands (the pre-SND posture).
+    if (getS3Config()) {
+      let head;
+      try {
+        head = await headObject(key);
+      } catch (err) {
+        if (err.code === 'object_not_found') {
+          return reply.code(422).send({
+            error: {
+              code: 'media_not_uploaded',
+              message: 'That object is not in storage — upload it before attaching it',
+            },
+          });
+        }
+        return reply.code(503).send({
+          error: {
+            code: 'storage_unavailable',
+            message: 'Storage could not verify the upload — nothing was attached',
+          },
+        });
+      }
+      if (head) {
+        const allowlist = UPLOAD_KINDS[kind === 'audio' ? 'audio' : 'image'];
+        if (head.contentType && !allowlist[head.contentType]) {
+          return reply.code(422).send({
+            error: {
+              code: 'media_type_mismatch',
+              message: `The stored object is '${head.contentType}', which is not an allowed ${kind} type`,
+            },
+          });
+        }
+        if (Number.isInteger(head.sizeBytes)) sizeBytes = head.sizeBytes;
+      }
+    }
     try {
       const { rows } = await pool.query(
         `INSERT INTO listing_media (listing_id, object_key, kind, position, title, duration_sec, size_bytes)
@@ -449,6 +710,35 @@ export function registerListingsRoutes(app, pool) {
         [listing.id, key, kind, title, durationSec, sizeBytes],
       );
       const row = rows[0];
+      // SND-02: new content on a CLEARED release reopens its review —
+      // the clearance covered the content the reviewer saw. The hold
+      // lands immediately; a live release also comes down, and both
+      // facts are audited.
+      if (
+        listing.medium === 'music' &&
+        listing.rights_state === 'cleared' &&
+        listing.content_kind !== 'original'
+      ) {
+        const wasPublished = listing.status === 'published';
+        await pool.query(
+          `UPDATE listings
+              SET rights_state = 'held_for_review',
+                  status = CASE WHEN $2 THEN 'draft' ELSE status END,
+                  updated_at = now()
+            WHERE id = $1`,
+          [listing.id, wasPublished],
+        );
+        await pool.query(
+          `INSERT INTO audit_log (actor_account_id, action, target, reason, meta)
+           VALUES ($1, 'listing.rights_review_reopened', $2, $3, $4)`,
+          [
+            req.account.id,
+            `listing:${listing.id}`,
+            'media attached after rights clearance — review reopens',
+            JSON.stringify({ mediaKind: kind, wasPublished }),
+          ],
+        );
+      }
       return reply.code(201).send({
         media: {
           id: row.id,
