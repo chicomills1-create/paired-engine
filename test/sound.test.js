@@ -21,6 +21,23 @@ const { makeArtist, deliverStripeEvent, sessionCompletedEvent } = await import('
 const { feeSnapshotForListing, musicFeeSnapshot, MUSIC_CALC_VERSION } = await import('../src/lib/fees.js');
 const { evaluateRelease } = await import('../src/lib/release.js');
 const { getStripe } = await import('../src/stripe.js');
+const { setHeadObjectProbe } = await import('../src/lib/storage.js');
+
+// SND-04: attach now verifies the stored object via HEAD whenever
+// storage is configured. This suite fabricates keys for objects it
+// never PUTs, so it installs the storage probe: every fabricated key
+// "exists" with a plausible content type for its extension and NO
+// reported size — the declared sizes therefore stand, exactly what
+// these tests assert. (The size-wins / not-found / type-mismatch
+// branches are proven in test/snd-controls.test.js.)
+const PROBE_TYPES = {
+  mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac', m4a: 'audio/mp4',
+  ogg: 'audio/ogg', jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp',
+};
+setHeadObjectProbe(async (key) => {
+  const ext = String(key).split('.').pop().toLowerCase();
+  return { sizeBytes: null, contentType: PROBE_TYPES[ext] || null };
+});
 
 let pool;
 let app;
