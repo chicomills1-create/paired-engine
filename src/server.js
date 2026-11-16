@@ -46,6 +46,12 @@ export function buildServer() {
   app.register(cors, {
     origin: (origin, cb) => cb(null, originAllowed(origin)),
     credentials: true,
+    // M7-D5: without an explicit methods list the plugin advertises only
+    // GET,HEAD,POST, and every browser DELETE/PATCH from pairedart.com
+    // (unsave, unfollow, unpublish, listing/profile edits) dies at
+    // preflight — the endpoints were never the problem. Advertise the
+    // full set the API actually serves.
+    methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'],
   });
 
   // Errors never leak stack traces or internals.
