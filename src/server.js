@@ -63,6 +63,24 @@ export function buildServer() {
     reply.code(404).send({ error: { code: 'not_found', message: 'Route not found' } });
   });
 
+  // M7-D1: the SPA's API client sends Content-Type: application/json on
+  // every call, including bodyless POST/DELETE actions (save, publish…).
+  // Fastify's default JSON parser rejects an empty body with 400
+  // FST_ERR_CTP_EMPTY_JSON_BODY before routing, so those actions could
+  // never reach a handler. This parser treats an empty (or whitespace-
+  // only) body as {} and otherwise parses exactly as the default did —
+  // malformed JSON still errors 400. The webhook scope below keeps its
+  // own raw-string parser for signature verification.
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
+    if (!body || !body.trim()) return done(null, {});
+    try {
+      done(null, JSON.parse(body));
+    } catch (err) {
+      err.statusCode = 400;
+      done(err);
+    }
+  });
+
   app.get('/health', async (req, reply) => {
     const up = await dbUp();
     if (!up) {
@@ -73,7 +91,10 @@ export function buildServer() {
 
   // Clerk + Stripe webhooks need the RAW body for signature verification,
   // so they live in an encapsulated scope with a string JSON parser.
+  // The scope inherits the M7-D1 root parser, so it removes that entry
+  // from its own copy before registering the raw-string parser.
   app.register(async (scope) => {
+    scope.removeContentTypeParser('application/json');
     scope.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
       done(null, body);
     });

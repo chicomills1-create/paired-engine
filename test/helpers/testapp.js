@@ -35,6 +35,18 @@ export async function buildTestApp(pool) {
   app.setNotFoundHandler((req, reply) => {
     reply.code(404).send({ error: { code: 'not_found', message: 'Route not found' } });
   });
+  // M7-D1: the same root JSON parser as production (src/server.js) — an
+  // empty body under a JSON content type parses as {}, never a 400
+  // FST_ERR_CTP_EMPTY_JSON_BODY; malformed JSON still errors 400.
+  app.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
+    if (!body || !body.trim()) return done(null, {});
+    try {
+      done(null, JSON.parse(body));
+    } catch (err) {
+      err.statusCode = 400;
+      done(err);
+    }
+  });
 
   const { registerArtistRoutes } = await import('../../src/routes/artist.js');
   const { registerListingsRoutes } = await import('../../src/routes/listings.js');
@@ -62,8 +74,10 @@ export async function buildTestApp(pool) {
   registerSoundRoutes(app, pool);
   registerSupportRoutes(app, pool);
   // Stripe webhooks verify against the RAW body — same encapsulated
-  // string-parser scope as production (src/server.js).
+  // string-parser scope as production (src/server.js), including the
+  // remove of the inherited M7-D1 root parser before re-registering.
   app.register(async (scope) => {
+    scope.removeContentTypeParser('application/json');
     scope.addContentTypeParser('application/json', { parseAs: 'string' }, (req, body, done) => {
       done(null, body);
     });
