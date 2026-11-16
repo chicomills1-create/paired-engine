@@ -16,10 +16,12 @@
 // the album itself carries) while nothing else is live, OR up to 5
 // tracks across non-album releases while no album is live.
 //
-// Storage accounting uses the DECLARED master sizes artists attach
-// with each track (listing_media.size_bytes): presigning cannot weigh
-// a file the client has not sent yet, so the declaration is the ledger
-// — the same honesty posture as the v64 form, now enforced here.
+// Storage accounting uses the master sizes recorded on each track
+// (listing_media.size_bytes). Since the SND-04 cure, that number is the
+// STORED OBJECT's real size, read server-side at attach time whenever
+// storage is configured (src/lib/storage.js headObject) — the artist's
+// declared size is only the fallback for the storage-unconfigured
+// posture, where no real upload could have happened anyway.
 
 export const GIB = 1024 * 1024 * 1024;
 
@@ -38,6 +40,28 @@ export function isAlbumType(releaseType) {
 export function musicCapsForTier(tier, entitledTier) {
   const effective = tier === 'founding' ? entitledTier || 'paired' : tier;
   return MUSIC_CAPS[effective] || MUSIC_CAPS.solo;
+}
+
+/**
+ * The sales-side rights predicate (SND-01): a release may be SOLD only
+ * while its rights are in force — both declaration legs affirmative, no
+ * open review hold, and a non-original release carrying a reviewer's
+ * clearance. The publish gate (below) and the checkout buy-door recheck
+ * share this one definition, so a declaration withdrawn or a hold
+ * opened after publication closes the door at checkout too.
+ */
+export function musicRightsInForce(listing) {
+  if (!listing || listing.medium !== 'music') return true;
+  if (listing.rights_recording !== true || listing.rights_composition !== true) return false;
+  if (listing.rights_state === 'held_for_review') return false;
+  if (
+    listing.content_kind &&
+    listing.content_kind !== 'original' &&
+    listing.rights_state !== 'cleared'
+  ) {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -82,10 +106,17 @@ export async function releaseFootprint(pool, listingId) {
 /**
  * The publish gate for a music listing, evaluated against live state.
  * Order mirrors the v64 gate the artists read: tracks exist →
- * declaration (both legs) → originals-only hold → capacity → storage.
+ * declaration (both legs) → rights-review hold → capacity → storage.
  * Returns { ok, reasons: string[], held: boolean } — `held` marks the
  * originals-only rights hold (the listing's rights_state is set by the
  * caller when a publish attempt lands there).
+ *
+ * The rights HOLD is a state, not a label check (SND-02): a listing in
+ * rights_state 'held_for_review' never publishes — whatever its declared
+ * content kind — until an authorized reviewer clears the hold (admin
+ * rights-review). A non-original release publishes only from
+ * rights_state 'cleared'; an original publishes from 'declared' or
+ * 'cleared'. Flipping the declared kind cannot launder a hold.
  */
 export async function musicPublishCheck(pool, { listing, tier, entitledTier }) {
   const caps = musicCapsForTier(tier, entitledTier);
@@ -103,7 +134,16 @@ export async function musicPublishCheck(pool, { listing, tier, entitledTier }) {
       ],
     };
   }
-  if (listing.content_kind && listing.content_kind !== 'original') {
+  if (listing.rights_state === 'held_for_review') {
+    return {
+      ok: false,
+      held: true,
+      reasons: [
+        'RIGHTS REVIEW HOLD — this release is held for per-release rights review. It publishes only when a reviewer clears the hold.',
+      ],
+    };
+  }
+  if (listing.content_kind && listing.content_kind !== 'original' && listing.rights_state !== 'cleared') {
     return {
       ok: false,
       held: true,

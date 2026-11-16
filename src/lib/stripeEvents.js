@@ -5,11 +5,22 @@
 // it transitions FROM, and every ledger write carries an idempotency key.
 //
 // Handled: checkout.session.completed · payment_intent.succeeded ·
-// checkout.session.expired · charge.dispute.created ·
+// checkout.session.expired · checkout.session.async_payment_succeeded ·
+// checkout.session.async_payment_failed · charge.dispute.created ·
 // charge.dispute.closed · charge.refunded · transfer.paid.
 // Anything else — including checkout sessions that are not ours (the
 // membership payment links live on the same Stripe account) — is
 // recorded and ignored, never errored.
+//
+// SND-03 (verified payment before delivery): a COMPLETED checkout
+// session is not a successful payment. Delayed payment methods finish
+// checkout with payment_status 'unpaid' and settle (or fail) later via
+// the async events. Entitlement — settlement, delivery, the buyer's
+// shelf — therefore follows the money: session.completed settles only
+// when the session itself reports the payment captured ('paid' /
+// 'no_payment_required'); an 'unpaid' completion records the payment
+// intent and waits. payment_intent.succeeded settles on its own (the
+// event IS the verified payment).
 import { transitionInventory } from './inventory.js';
 import { appendLedger } from './ledger.js';
 import { applyOrderCancel } from './checkout.js';
@@ -332,7 +343,47 @@ export async function applyStripeEvent(client, event) {
     case 'checkout.session.completed': {
       const order = await findOrderForSession(client, obj);
       if (!order) return; // not an engine checkout (e.g. a membership link)
+      if (obj.payment_status === 'unpaid') {
+        // Checkout finished but the money has NOT landed (delayed
+        // payment method). Record the intent so the async outcome
+        // events resolve to this order, and grant NOTHING: no
+        // settlement, no delivery, no shelf (SND-03).
+        if (obj.payment_intent) {
+          await client.query(
+            `UPDATE payments
+                SET stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, $2),
+                    updated_at = now()
+              WHERE order_id = $1`,
+            [order.id, obj.payment_intent],
+          );
+        }
+        await client.query(
+          `INSERT INTO audit_log (actor_account_id, action, target, reason, meta)
+           VALUES (NULL, 'payment.async_pending', $1, $2, $3)`,
+          [
+            `order:${order.id}`,
+            'checkout completed with payment_status unpaid — entitlement waits for the payment',
+            JSON.stringify({ sessionId: obj.id || null, paymentIntentId: obj.payment_intent || null }),
+          ],
+        );
+        return;
+      }
       await settlePayment(client, order, { paymentIntentId: obj.payment_intent || null });
+      return;
+    }
+    case 'checkout.session.async_payment_succeeded': {
+      // The delayed payment landed — NOW the order settles.
+      const order = await findOrderForSession(client, obj);
+      if (!order) return;
+      await settlePayment(client, order, { paymentIntentId: obj.payment_intent || null });
+      return;
+    }
+    case 'checkout.session.async_payment_failed': {
+      // The delayed payment failed: nothing was granted, and the open
+      // checkout closes exactly like an expired session.
+      const order = await findOrderForSession(client, obj);
+      if (!order || order.status !== 'checkout_open') return;
+      await applyOrderCancel(client, order);
       return;
     }
     case 'payment_intent.succeeded': {

@@ -20,6 +20,17 @@
 //                                 pair-scoped: a dispute freezes the legs of
 //                                 its own order and this pair's new checkouts,
 //                                 never the artist's whole book)
+//   8. artist_account_active    — the artist's account itself is active
+//                                 (a suspension — e.g. a Clerk ban landing
+//                                 through the webhook — closes every door
+//                                 the artist sells through; SND-05)
+//   9. music_rights_in_force    — music only: the release's rights are in
+//                                 force at checkout time, not just at
+//                                 publish time — both declaration legs
+//                                 affirmative, no open review hold, and a
+//                                 non-original release carrying a
+//                                 reviewer's clearance (SND-01/SND-02;
+//                                 src/lib/music.js musicRightsInForce)
 //
 // Checkout creation is also where the one-of-one reservation lands:
 // a transactional, guarded available → reserved transition holding the
@@ -36,6 +47,7 @@ import { randomUUID } from 'node:crypto';
 import { feeSnapshotForListing } from './fees.js';
 import { transitionInventory } from './inventory.js';
 import { initialFulfillmentState } from './fulfillment.js';
+import { musicRightsInForce } from './music.js';
 
 export const CHECKOUT_CONDITIONS = Object.freeze([
   'listing_published',
@@ -45,6 +57,8 @@ export const CHECKOUT_CONDITIONS = Object.freeze([
   'buyer_is_not_seller',
   'price_above_zero',
   'no_open_dispute_freeze',
+  'artist_account_active',
+  'music_rights_in_force',
 ]);
 
 export const RESERVATION_MINUTES = 15;
@@ -120,6 +134,17 @@ export async function recheckBuyDoor(pool, { buyerId, listing }) {
     [buyerId, artistId],
   );
   if (disputeRows.length) failed.push('no_open_dispute_freeze');
+
+  const { rows: accountRows } = await pool.query('SELECT status FROM accounts WHERE id = $1', [
+    artistId,
+  ]);
+  if (!accountRows.length || accountRows[0].status !== 'active') {
+    failed.push('artist_account_active');
+  }
+
+  if (listing.medium === 'music' && !musicRightsInForce(listing)) {
+    failed.push('music_rights_in_force');
+  }
 
   return { ok: failed.length === 0, failed };
 }
@@ -234,6 +259,15 @@ export async function createCheckout(pool, stripe, { buyer, listingId }) {
       await client.query('ROLLBACK');
       throw httpError(422, 'buy_door_closed', 'This listing cannot be checked out right now', {
         failed: ['inventory_available'],
+      });
+    }
+    if (isMusic && !musicRightsInForce(current)) {
+      // Re-verified under the row lock (SND-01): a declaration withdrawn
+      // or a review hold opened between the door recheck and this
+      // transaction still closes the sale.
+      await client.query('ROLLBACK');
+      throw httpError(422, 'buy_door_closed', 'This listing cannot be checked out right now', {
+        failed: ['music_rights_in_force'],
       });
     }
 
