@@ -18,6 +18,7 @@ import { registerStudioRoutes } from './routes/studio.js';
 import { registerRoomRoutes } from './routes/room.js';
 import { registerAdminRoutes } from './routes/admin.js';
 import { registerSoundRoutes } from './routes/sound.js';
+import { registerSupportRoutes } from './routes/support.js';
 import { runCommerceSweeps } from './lib/release.js';
 import { runReconciliation } from './lib/reconcile.js';
 import { getStripe } from './stripe.js';
@@ -91,6 +92,7 @@ export function buildServer() {
   registerRoomRoutes(app, pool);
   registerAdminRoutes(app, pool);
   registerSoundRoutes(app, pool);
+  registerSupportRoutes(app, pool);
 
   // Stripe is initialized lazily and guarded: identity legs boot without it.
   if (!getStripe()) {
