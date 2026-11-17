@@ -33,7 +33,10 @@ async function postBrief(as, payload = {}) {
     method: 'POST',
     url: '/v1/briefs',
     as,
-    payload: { title: 'A mural for the studio wall', budgetCents: 30000, ...payload },
+    // A mural is a physical deliverable; the declaration is the
+    // commission's tax classification input (§3) and pitch-accept
+    // fails closed without it.
+    payload: { title: 'A mural for the studio wall', budgetCents: 30000, deliverableType: 'physical', ...payload },
   });
 }
 

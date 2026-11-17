@@ -24,6 +24,7 @@
 import { transitionInventory } from './inventory.js';
 import { appendLedger } from './ledger.js';
 import { applyOrderCancel } from './checkout.js';
+import { sessionTaxCents } from './tax.js';
 
 const TRANSFERRED_STATES = ['created', 'paid', 'manual_recorded'];
 
@@ -68,29 +69,44 @@ async function findPayment(client, { chargeId = null, paymentIntentId = null, or
  * Settle an order's payment exactly once. The guarded UPDATE is the
  * gate: a second delivery (the session event AND the payment-intent
  * event both fire for one purchase) matches no row and changes nothing.
+ *
+ * TAX (§3, TAX-04): settlement math reads ONLY the order record — the
+ * ledger accruals below are the order's immutable fee snapshot, never
+ * a charged total. `taxCents` (the tax Stripe collected, from the
+ * session's total_details.amount_tax) is RECORDED on the payment for
+ * reconciliation; it is never an input to any split. The session
+ * events carry it; the payment-intent event does not, so whichever
+ * session delivery lands records it (COALESCE keeps the first value).
  */
-async function settlePayment(client, order, { paymentIntentId = null, chargeId = null } = {}) {
+async function settlePayment(
+  client,
+  order,
+  { paymentIntentId = null, chargeId = null, taxCents = null } = {},
+) {
   const { rows } = await client.query(
     `UPDATE payments
         SET status = 'succeeded',
             settled_at = COALESCE(settled_at, now()),
             stripe_payment_intent_id = COALESCE($2, stripe_payment_intent_id),
             stripe_charge_id = COALESCE($3, stripe_charge_id),
+            tax_cents = COALESCE($4, tax_cents),
             updated_at = now()
       WHERE order_id = $1 AND status NOT IN ('succeeded', 'refunded')
       RETURNING *`,
-    [order.id, paymentIntentId, chargeId],
+    [order.id, paymentIntentId, chargeId, taxCents],
   );
   if (!rows.length) {
     // Already settled (the twin event arrived first): still record any
-    // Stripe ids this delivery carries, then stop — no second effects.
+    // Stripe ids — and the tax figure — this delivery carries, then
+    // stop: no second effects.
     await client.query(
       `UPDATE payments
           SET stripe_payment_intent_id = COALESCE(stripe_payment_intent_id, $2),
               stripe_charge_id = COALESCE(stripe_charge_id, $3),
+              tax_cents = COALESCE(tax_cents, $4),
               updated_at = now()
         WHERE order_id = $1`,
-      [order.id, paymentIntentId, chargeId],
+      [order.id, paymentIntentId, chargeId, taxCents],
     );
     return false;
   }
@@ -368,14 +384,20 @@ export async function applyStripeEvent(client, event) {
         );
         return;
       }
-      await settlePayment(client, order, { paymentIntentId: obj.payment_intent || null });
+      await settlePayment(client, order, {
+        paymentIntentId: obj.payment_intent || null,
+        taxCents: sessionTaxCents(obj),
+      });
       return;
     }
     case 'checkout.session.async_payment_succeeded': {
       // The delayed payment landed — NOW the order settles.
       const order = await findOrderForSession(client, obj);
       if (!order) return;
-      await settlePayment(client, order, { paymentIntentId: obj.payment_intent || null });
+      await settlePayment(client, order, {
+        paymentIntentId: obj.payment_intent || null,
+        taxCents: sessionTaxCents(obj),
+      });
       return;
     }
     case 'checkout.session.async_payment_failed': {

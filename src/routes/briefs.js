@@ -40,6 +40,7 @@ export function briefView(row, pitchCount = null) {
     description: row.description,
     budgetCents: row.budget_cents,
     category: row.category,
+    deliverableType: row.deliverable_type ?? null,
     status: row.status,
     awardedPitchId: row.awarded_pitch_id,
     pitchCount,
@@ -81,6 +82,12 @@ export function registerBriefsRoutes(app, pool) {
 
   // POST /v1/briefs — post a commission brief. A real budget is required:
   // the board carries real briefs with real budgets, never placeholders.
+  // deliverableType declares what the artist will deliver — 'physical'
+  // (shipped artwork), 'digital' (finished artwork delivered
+  // electronically), 'service' (the deliverable is the artist's service).
+  // It is the commission's tax classification input (migration 0007,
+  // §3): optional to post, but a brief without it cannot be awarded —
+  // pitch-accept fails closed until the deliverable is declared.
   app.post('/v1/briefs', { preHandler: auth }, async (req, reply) => {
     const body = req.body || {};
     const title = typeof body.title === 'string' ? body.title.trim().slice(0, 200) : '';
@@ -88,15 +95,23 @@ export function registerBriefsRoutes(app, pool) {
     if (!Number.isInteger(body.budgetCents) || body.budgetCents <= 0) {
       return badRequest(reply, 'budgetCents must be a positive integer (cents)');
     }
+    let deliverableType = null;
+    if (body.deliverableType !== undefined && body.deliverableType !== null) {
+      if (!['physical', 'digital', 'service'].includes(body.deliverableType)) {
+        return badRequest(reply, "deliverableType must be 'physical', 'digital' or 'service'");
+      }
+      deliverableType = body.deliverableType;
+    }
     const { rows } = await pool.query(
-      `INSERT INTO briefs (buyer_account_id, title, description, budget_cents, category)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+      `INSERT INTO briefs (buyer_account_id, title, description, budget_cents, category, deliverable_type)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
       [
         req.account.id,
         title,
         typeof body.description === 'string' ? body.description.slice(0, 5000) : null,
         body.budgetCents,
         typeof body.category === 'string' ? body.category.slice(0, 120) : null,
+        deliverableType,
       ],
     );
     return reply.code(201).send({ brief: briefView(rows[0], 0) });

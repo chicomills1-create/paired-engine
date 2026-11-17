@@ -169,7 +169,7 @@ export async function runReconciliation(pool, stripe, { lookbackDays = DEFAULT_L
     const piIds = settledCharges.map((c) => c.payment_intent).filter(Boolean);
     const { rows: paymentRows } = piIds.length
       ? await pool.query(
-          'SELECT order_id, amount_cents, status, stripe_payment_intent_id FROM payments WHERE stripe_payment_intent_id = ANY($1)',
+          'SELECT order_id, amount_cents, tax_cents, status, stripe_payment_intent_id FROM payments WHERE stripe_payment_intent_id = ANY($1)',
           [piIds],
         )
       : [];
@@ -191,12 +191,22 @@ export async function runReconciliation(pool, stripe, { lookbackDays = DEFAULT_L
           stripeObjectId: c.payment_intent,
           detail: { chargeId: c.id, amountCents: c.amount, localStatus: local.status },
         });
-      } else if (local.amount_cents !== c.amount) {
+      } else if (local.amount_cents + (local.tax_cents ?? 0) !== c.amount) {
+        // Pricing is tax-EXCLUSIVE (§3): the charge total is the item
+        // price plus the tax Stripe collected, while amount_cents stays
+        // the item price. The expected charge is the two together —
+        // comparing against the price alone would flag every taxed
+        // sale as a discrepancy.
         await note({
           kind: 'payment_amount_mismatch',
           orderId: local.order_id,
           stripeObjectId: c.payment_intent,
-          detail: { stripeAmountCents: c.amount, localAmountCents: local.amount_cents },
+          detail: {
+            stripeAmountCents: c.amount,
+            localAmountCents: local.amount_cents,
+            localTaxCents: local.tax_cents ?? null,
+            expectedTotalCents: local.amount_cents + (local.tax_cents ?? 0),
+          },
         });
       }
     }

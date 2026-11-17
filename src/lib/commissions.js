@@ -18,6 +18,11 @@
 // (buyer ≠ artist is structural: a brief's owner can never pitch it, and
 // the accept route resolves the buyer from the brief, never the body.)
 //
+// TAX (§3): the session's classification resolves from the brief's
+// declared deliverable type (briefs.deliverable_type, migration 0007).
+// An undeclared brief fails closed with 422 tax_classification_unresolved
+// before any record is written — see src/lib/tax.js.
+//
 // WITHOUT STRIPE CONFIGURED the leg fails closed with 503 not_configured
 // BEFORE any record is written — the attempt is recorded in audit_log
 // (intent), exactly like the M3 listing door. No session is fabricated,
@@ -26,6 +31,7 @@ import { randomUUID } from 'node:crypto';
 import { feeSnapshot } from './fees.js';
 import { httpError, artistFeeTier } from './checkout.js';
 import { initialFulfillmentState } from './fulfillment.js';
+import { classifyCommissionTax, taxSessionParams } from './tax.js';
 
 export const COMMISSION_CONDITIONS = Object.freeze([
   'brief_open',
@@ -54,7 +60,7 @@ function checkoutUrls() {
 export async function createCommissionCheckout(pool, stripe, { buyer, pitchId }) {
   const { rows: pitchRows } = await pool.query(
     `SELECT p.*, b.buyer_account_id AS brief_buyer_id, b.status AS brief_status,
-            b.title AS brief_title
+            b.title AS brief_title, b.deliverable_type AS brief_deliverable_type
        FROM pitches p JOIN briefs b ON b.id = p.brief_id
       WHERE p.id = $1`,
     [pitchId],
@@ -111,6 +117,21 @@ export async function createCommissionCheckout(pool, stripe, { buyer, pitchId })
   if (disputeRows.length) failed.push('no_open_dispute_freeze');
   if (failed.length) {
     throw httpError(422, 'buy_door_closed', 'This pitch cannot be accepted right now', { failed });
+  }
+
+  // TAX (§3): the classification comes from the brief's declared
+  // deliverable type (migration 0007) — the buyer's declaration of what
+  // will be delivered, made before this checkout exists. An undeclared
+  // brief (every brief posted before the declaration existed) FAILS
+  // CLOSED here, before any record is written: no session, no award,
+  // and never a fall back to the account's tax preset.
+  const taxClass = classifyCommissionTax(pitch.brief_deliverable_type);
+  if (!taxClass) {
+    throw httpError(
+      422,
+      'tax_classification_unresolved',
+      'This brief does not declare a deliverable type, so its tax classification cannot be resolved; checkout cannot be created',
+    );
   }
 
   const { tier, entitledTier } = await artistFeeTier(pool, pitch.artist_account_id);
@@ -216,13 +237,18 @@ export async function createCommissionCheckout(pool, stripe, { buyer, pitchId })
   try {
     session = await stripe.checkout.sessions.create({
       mode: 'payment',
+      ...taxSessionParams(taxClass),
       line_items: [
         {
           quantity: 1,
           price_data: {
             currency: 'usd',
             unit_amount: pitch.price_cents,
-            product_data: { name: `Commission — ${pitch.brief_title || 'PAIRED brief'}` },
+            tax_behavior: 'exclusive',
+            product_data: {
+              name: `Commission — ${pitch.brief_title || 'PAIRED brief'}`,
+              tax_code: taxClass.taxCode,
+            },
           },
         },
       ],
