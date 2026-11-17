@@ -7,7 +7,9 @@
 // Handled: checkout.session.completed · payment_intent.succeeded ·
 // checkout.session.expired · checkout.session.async_payment_succeeded ·
 // checkout.session.async_payment_failed · charge.dispute.created ·
-// charge.dispute.closed · charge.refunded · transfer.paid.
+// charge.dispute.closed · charge.refunded · transfer.created ·
+// transfer.paid (retired by Stripe; kept for back-compat) ·
+// transfer.reversed · transfer.updated (explicitly ignored).
 // Anything else — including checkout sessions that are not ours (the
 // membership payment links live on the same Stripe account) — is
 // recorded and ignored, never errored.
@@ -352,6 +354,56 @@ async function applyChargeRefunded(client, charge) {
   }
 }
 
+async function applyTransferReversed(client, transfer) {
+  // Stripe pulled a transfer back out of the artist's Connect balance.
+  // The guarded UPDATE is the whole idempotency story: a redelivery (or
+  // a transfer that was never ours) matches no row and changes nothing.
+  const { rows } = await client.query(
+    `UPDATE releases SET transfer_state = 'reversed', updated_at = now()
+      WHERE stripe_transfer_id = $1 AND transfer_state IN ('created', 'paid')
+      RETURNING *`,
+    [transfer.id],
+  );
+  if (!rows.length) return;
+  const release = rows[0];
+  const order = await getOrder(client, release.order_id);
+  const amountReversedCents = Number.isInteger(transfer.amount_reversed)
+    ? transfer.amount_reversed
+    : Number.isInteger(transfer.amount)
+      ? transfer.amount
+      : null;
+  await client.query(
+    `INSERT INTO audit_log (actor_account_id, action, target, reason, meta)
+     VALUES (NULL, 'transfer.reversed', $1, $2, $3)`,
+    [
+      `order:${release.order_id}`,
+      'stripe reversed the transfer behind a release',
+      JSON.stringify({ stripeTransferId: transfer.id, amountReversedCents }),
+    ],
+  );
+  // The same exception reconciliation raises for this exact condition
+  // (reconcile.js, kind 'transfer_reversed_after_release'), keyed the
+  // same way, so the webhook and the reconcile job dedupe onto ONE
+  // open exception instead of piling up two. No recovery case: unlike
+  // a post-transfer dispute, the reversal IS Stripe's own clawback —
+  // the funds are already back; what a human must decide is why it
+  // happened and whether the artist was already paid out against it.
+  await client.query(
+    `INSERT INTO exception_queue (kind, order_id, account_id, stripe_object_id, detail, dedupe_key)
+     VALUES ('transfer_reversed_after_release', $1, $2, $3, $4, $5)
+     ON CONFLICT (dedupe_key) DO UPDATE
+       SET detail = EXCLUDED.detail, updated_at = now()
+       WHERE exception_queue.state = 'open'`,
+    [
+      release.order_id,
+      order?.artist_account_id || null,
+      transfer.id,
+      JSON.stringify({ amountReversedCents, transferState: 'reversed', via: 'webhook' }),
+      `transfer_reversed_after_release:${transfer.id}`,
+    ],
+  );
+}
+
 /** Apply one Stripe event inside the caller's transaction. */
 export async function applyStripeEvent(client, event) {
   const obj = event?.data?.object || {};
@@ -436,9 +488,15 @@ export async function applyStripeEvent(client, event) {
     case 'charge.refunded':
       await applyChargeRefunded(client, obj);
       return;
+    case 'transfer.created':
     case 'transfer.paid': {
-      // The TRANSFER leg only. Bank payout state is a separate status and
-      // is never advanced from a transfer event (M0).
+      // The TRANSFER leg only. transfer.paid is retired in current API
+      // versions; transfer.created is its successor — a created transfer
+      // is the completed movement into the destination's balance. (Our
+      // own release flow records the transfer id synchronously when it
+      // creates the transfer, so this event confirms it after the fact.)
+      // Bank payout state is a separate status and is never advanced
+      // from a transfer event (M0).
       await client.query(
         `UPDATE releases SET transfer_state = 'paid', updated_at = now()
           WHERE stripe_transfer_id = $1 AND transfer_state = 'created'`,
@@ -446,6 +504,14 @@ export async function applyStripeEvent(client, event) {
       );
       return;
     }
+    case 'transfer.reversed':
+      await applyTransferReversed(client, obj);
+      return;
+    case 'transfer.updated':
+      // Informational only (amount/metadata edits on the transfer):
+      // recorded in the inbox, deliberately no state effect — transfer
+      // state advances on transfer.created and transfer.reversed.
+      return;
     default:
       return; // recorded in the inbox; nothing to apply
   }
