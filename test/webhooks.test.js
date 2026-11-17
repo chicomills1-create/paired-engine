@@ -243,6 +243,115 @@ test('transfer.paid advances the transfer status only — payout stays separate'
   assert.equal(rel2[0].payout_state, 'pending'); // bank payout is its own status
 });
 
+test('transfer.created advances the transfer status only — payout stays separate; redelivery is a no-op', async () => {
+  const { orderId } = await settledOrder('tc_tessa', 'buyer_tc1');
+  await fulfillToAccepted(orderId, 'tc_tessa', 'buyer_tc1');
+  const { rows: rel } = await pool.query('SELECT * FROM releases WHERE order_id = $1', [orderId]);
+  assert.equal(rel[0].transfer_state, 'created');
+  assert.equal(rel[0].payout_state, 'pending');
+  const event = {
+    type: 'transfer.created',
+    data: { object: { id: rel[0].stripe_transfer_id } },
+  };
+  await deliverStripeEvent(pool, { ...event, id: nextEventId('evt_tc') });
+  const { rows: rel2 } = await pool.query('SELECT * FROM releases WHERE order_id = $1', [orderId]);
+  assert.equal(rel2[0].transfer_state, 'paid');
+  assert.equal(rel2[0].payout_state, 'pending'); // bank payout is its own status
+
+  // The same event under a FRESH event id actually reaches the handler
+  // (the inbox dedupe cannot save us) — the state guard makes it a no-op.
+  await deliverStripeEvent(pool, { ...event, id: nextEventId('evt_tc') });
+  const { rows: rel3 } = await pool.query('SELECT * FROM releases WHERE order_id = $1', [orderId]);
+  assert.equal(rel3[0].transfer_state, 'paid');
+  assert.equal(rel3[0].payout_state, 'pending');
+  const { rows: side } = await pool.query(
+    `SELECT * FROM exception_queue WHERE stripe_object_id = $1`,
+    [rel[0].stripe_transfer_id],
+  );
+  assert.equal(side.length, 0);
+});
+
+test('transfer.created for an unknown transfer id is recorded and ignored', async () => {
+  const res = await deliverStripeEvent(pool, {
+    id: nextEventId('evt_tc'),
+    type: 'transfer.created',
+    data: { object: { id: 'tr_not_ours_1' } },
+  });
+  assert.equal(res.failed, 0);
+  const { rows } = await pool.query(
+    `SELECT * FROM exception_queue WHERE stripe_object_id = 'tr_not_ours_1'`,
+  );
+  assert.equal(rows.length, 0);
+});
+
+test('transfer.reversed on a paid release sets reversed + audit + one exception; redelivery adds nothing', async () => {
+  const { orderId } = await settledOrder('tr_rhea', 'buyer_tr1');
+  await fulfillToAccepted(orderId, 'tr_rhea', 'buyer_tr1');
+  const { rows: rel } = await pool.query('SELECT * FROM releases WHERE order_id = $1', [orderId]);
+  const transferId = rel[0].stripe_transfer_id;
+  await deliverStripeEvent(pool, {
+    id: nextEventId('evt_tc'),
+    type: 'transfer.created',
+    data: { object: { id: transferId } },
+  });
+  const { rows: paid } = await pool.query('SELECT transfer_state FROM releases WHERE order_id = $1', [orderId]);
+  assert.equal(paid[0].transfer_state, 'paid');
+
+  const reversedEvent = {
+    type: 'transfer.reversed',
+    data: { object: { id: transferId, amount: 19000, amount_reversed: 19000, reversed: true } },
+  };
+  await deliverStripeEvent(pool, { ...reversedEvent, id: nextEventId('evt_tr') });
+  const { rows: rel2 } = await pool.query('SELECT * FROM releases WHERE order_id = $1', [orderId]);
+  assert.equal(rel2[0].transfer_state, 'reversed');
+  assert.equal(rel2[0].payout_state, 'pending'); // a reversal asserts nothing about the bank payout
+  const { rows: audit } = await pool.query(
+    `SELECT * FROM audit_log WHERE action = 'transfer.reversed' AND target = $1`,
+    [`order:${orderId}`],
+  );
+  assert.equal(audit.length, 1);
+  assert.equal(audit[0].meta.stripeTransferId, transferId);
+  assert.equal(audit[0].meta.amountReversedCents, 19000);
+  const { rows: exc } = await pool.query(
+    `SELECT * FROM exception_queue WHERE dedupe_key = $1`,
+    [`transfer_reversed_after_release:${transferId}`],
+  );
+  assert.equal(exc.length, 1);
+  assert.equal(exc[0].kind, 'transfer_reversed_after_release');
+  assert.equal(exc[0].state, 'open');
+  assert.equal(exc[0].order_id, orderId);
+
+  // Redelivery under a fresh event id: state guard + dedupe key hold —
+  // still exactly one audit row and one exception.
+  await deliverStripeEvent(pool, { ...reversedEvent, id: nextEventId('evt_tr') });
+  const { rows: rel3 } = await pool.query('SELECT transfer_state FROM releases WHERE order_id = $1', [orderId]);
+  assert.equal(rel3[0].transfer_state, 'reversed');
+  const { rows: audit2 } = await pool.query(
+    `SELECT * FROM audit_log WHERE action = 'transfer.reversed' AND target = $1`,
+    [`order:${orderId}`],
+  );
+  assert.equal(audit2.length, 1);
+  const { rows: exc2 } = await pool.query(
+    `SELECT * FROM exception_queue WHERE dedupe_key = $1`,
+    [`transfer_reversed_after_release:${transferId}`],
+  );
+  assert.equal(exc2.length, 1);
+});
+
+test('transfer.reversed also lands from the created state (reversal before confirmation)', async () => {
+  const { orderId } = await settledOrder('tr_cato', 'buyer_tr2');
+  await fulfillToAccepted(orderId, 'tr_cato', 'buyer_tr2');
+  const { rows: rel } = await pool.query('SELECT * FROM releases WHERE order_id = $1', [orderId]);
+  assert.equal(rel[0].transfer_state, 'created');
+  await deliverStripeEvent(pool, {
+    id: nextEventId('evt_tr'),
+    type: 'transfer.reversed',
+    data: { object: { id: rel[0].stripe_transfer_id, amount: 19000, amount_reversed: 19000, reversed: true } },
+  });
+  const { rows: rel2 } = await pool.query('SELECT transfer_state FROM releases WHERE order_id = $1', [orderId]);
+  assert.equal(rel2[0].transfer_state, 'reversed');
+});
+
 test('webhook route: bad signature 400, valid 200, redelivery deduped', async () => {
   const event = {
     id: 'evt_route_1',
