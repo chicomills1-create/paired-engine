@@ -48,6 +48,7 @@ import { feeSnapshotForListing } from './fees.js';
 import { transitionInventory } from './inventory.js';
 import { initialFulfillmentState } from './fulfillment.js';
 import { musicRightsInForce } from './music.js';
+import { classifyListingTax, taxSessionParams } from './tax.js';
 
 export const CHECKOUT_CONDITIONS = Object.freeze([
   'listing_published',
@@ -205,6 +206,20 @@ export async function createCheckout(pool, stripe, { buyer, listingId }) {
       failed: ['artist_payout_path_live'],
     });
   }
+  // TAX (§3): the line item's classification resolves from the listing
+  // itself (medium + type) BEFORE any record is written. The schema
+  // constrains both fields, so a null here means a corrupt record —
+  // fail closed rather than let the item inherit the account's
+  // digital-services tax preset.
+  const taxClass = classifyListingTax(listing);
+  if (!taxClass) {
+    throw httpError(
+      422,
+      'tax_classification_unresolved',
+      'This listing has no resolvable tax classification; checkout cannot be created',
+    );
+  }
+
   // Music is not one-of-one: a release sells to every buyer, so there
   // is nothing to reserve and nothing to deplete. The order carries no
   // reservation and the listing stays 'available' through settlement.
@@ -324,13 +339,18 @@ export async function createCheckout(pool, stripe, { buyer, listingId }) {
   try {
     session = await stripe.checkout.sessions.create({
       mode: 'payment',
+      ...taxSessionParams(taxClass),
       line_items: [
         {
           quantity: 1,
           price_data: {
             currency: 'usd',
             unit_amount: listing.price_cents,
-            product_data: { name: listing.title || 'PAIRED artwork' },
+            tax_behavior: 'exclusive',
+            product_data: {
+              name: listing.title || 'PAIRED artwork',
+              tax_code: taxClass.taxCode,
+            },
           },
         },
       ],
