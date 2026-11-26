@@ -32,6 +32,7 @@ import { feeSnapshot } from './fees.js';
 import { httpError, artistFeeTier } from './checkout.js';
 import { initialFulfillmentState } from './fulfillment.js';
 import { classifyCommissionTax, taxSessionParams } from './tax.js';
+import { mirrorPitchAward, mirrorAwardCompensation } from './intake.js';
 
 export const COMMISSION_CONDITIONS = Object.freeze([
   'brief_open',
@@ -223,6 +224,10 @@ export async function createCommissionCheckout(pool, stripe, { buyer, pitchId })
         WHERE id = $2`,
       [pitch.id, pitch.brief_id],
     );
+    // v91 intake mirror, SAME transaction (verdict A1/A2): the award
+    // moves the proposal + brief intake records with the canonical
+    // award — the layers can never disagree about an accepted pitch.
+    await mirrorPitchAward(client, { briefId: pitch.brief_id, pitchId: pitch.id });
     await client.query('COMMIT');
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
@@ -333,6 +338,9 @@ export async function cancelCommissionAward(pool, orderId, pitchId) {
           WHERE id = $1 AND awarded_pitch_id = $2`,
         [pitch.brief_id, pitchId],
       );
+      // v91 intake mirror, SAME transaction: the compensation restores
+      // the intake states to match the canonical restore above.
+      await mirrorAwardCompensation(client, { briefId: pitch.brief_id, pitchId });
     }
     await client.query('COMMIT');
     return order;

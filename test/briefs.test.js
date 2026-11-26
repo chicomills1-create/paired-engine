@@ -63,8 +63,35 @@ test('brief creation validates the budget and lands on the board', async () => {
   assert.equal(brief.budgetCents, 30000);
   assert.equal(brief.pitchCount, 0);
 
-  const board = await call(app, { method: 'GET', url: '/v1/briefs' });
-  assert.ok(board.json().briefs.some((b) => b.id === brief.id));
+  // v91 SUPERSEDES the last leg of this test's original form: a fresh
+  // brief is RECEIVED, not public — it lands on the board only when
+  // ops publishes it (intake VISIBLE). Assert both halves.
+  const submission = ok.json().submission;
+  assert.ok(submission?.reference?.startsWith('PAIRED-'), 'brief carries its intake reference');
+  assert.equal(submission.status, 'RECEIVED');
+  let board = await call(app, { method: 'GET', url: '/v1/briefs' });
+  assert.ok(!board.json().briefs.some((b) => b.id === brief.id), 'unpublished brief is not on the board');
+
+  const { accountIdFor, grantRole } = await import('./helpers/testapp.js');
+  await call(app, { method: 'GET', url: '/v1/me', as: 'opsdesk' });
+  await grantRole(pool, await accountIdFor(pool, 'opsdesk'), 'admin');
+  const queue = await call(app, {
+    method: 'GET',
+    url: `/v1/admin/intake/queue?q=${submission.reference}`,
+    as: 'opsdesk',
+  });
+  const deskRow = queue.json().submissions[0];
+  assert.ok(deskRow, 'the brief is on the Intake Desk');
+  const published = await call(app, {
+    method: 'POST',
+    url: `/v1/admin/intake/${deskRow.id}/transition`,
+    as: 'opsdesk',
+    payload: { to: 'VISIBLE', reason: 'test: publish the brief' },
+  });
+  assert.equal(published.statusCode, 200, published.body);
+
+  board = await call(app, { method: 'GET', url: '/v1/briefs' });
+  assert.ok(board.json().briefs.some((b) => b.id === brief.id), 'published brief is on the board');
 });
 
 test('the owner can cancel an open brief; it leaves the board', async () => {

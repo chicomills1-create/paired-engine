@@ -5,11 +5,16 @@
 // records the decision, and every decision writes an audit_log row with the
 // actor and reason. Counters can never exceed 100 or double-allocate.
 import { requireAuth, requireRole } from '../auth.js';
+import { attachIntake, intakeForCanonical, transitionIntake, submissionView } from '../lib/intake.js';
 
 export function registerFoundingRoutes(app, pool) {
   const auth = requireAuth(pool);
 
   // POST /v1/founding/apply — one live application per account.
+  // v91: the canonical insert and its intake record commit in ONE
+  // transaction (verdict A1/D2 — this route is NOT replaced; the
+  // intake layer adds the unified reference + status visibility), and
+  // the response carries the submission receipt.
   app.post('/v1/founding/apply', { preHandler: auth }, async (req, reply) => {
     const note = typeof req.body?.note === 'string' ? req.body.note.slice(0, 2000) : null;
     const { rows: existing } = await pool.query(
@@ -26,12 +31,36 @@ export function registerFoundingRoutes(app, pool) {
         },
       });
     }
-    const { rows } = await pool.query(
-      `INSERT INTO founding_applications (account_id, note) VALUES ($1, $2)
-       RETURNING id, status, created_at`,
-      [req.account.id, note],
-    );
-    return reply.code(201).send({ application: rows[0] });
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const { rows } = await client.query(
+        `INSERT INTO founding_applications (account_id, note) VALUES ($1, $2)
+         RETURNING id, status, created_at`,
+        [req.account.id, note],
+      );
+      const { submission } = await attachIntake(client, {
+        type: 'founding',
+        ownerAccountId: req.account.id,
+        contactEmail: req.account.email || null,
+        payload: note ? { note } : {},
+        consentAt: new Date().toISOString(),
+        idempotencyScope: `acct:${req.account.id}`,
+        idempotencyKey: `founding:${rows[0].id}`,
+        canonicalTable: 'founding_applications',
+        canonicalId: rows[0].id,
+      });
+      await client.query('COMMIT');
+      return reply.code(201).send({
+        application: rows[0],
+        submission: submissionView(submission),
+      });
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
   });
 
   // GET /v1/founding/status — my application state + server-truth seat count.
@@ -147,6 +176,33 @@ export function registerFoundingRoutes(app, pool) {
             WHERE id = $3`,
           [decision, req.account.id, applicationId],
         );
+        // v91 intake mirror, SAME transaction: the founding decision
+        // moves the application's unified status with it (the founding
+        // workflow's own seat/role effects above are the canonical
+        // business act — an intake status change alone never grants
+        // them; verdict §D3).
+        const foundingIntake = await intakeForCanonical(client, 'founding_applications', applicationId);
+        if (foundingIntake && ['RECEIVED', 'UNDER_REVIEW', 'ACTION_REQUIRED'].includes(foundingIntake.status)) {
+          // The application machine requires review before a decision:
+          // a decision taken straight from RECEIVED walks through
+          // UNDER_REVIEW first (both steps land on the event trail).
+          if (foundingIntake.status === 'RECEIVED') {
+            await transitionIntake(client, {
+              id: foundingIntake.id,
+              to: 'UNDER_REVIEW',
+              actorType: 'ops',
+              actorAccountId: req.account.id,
+              note: 'Decision review opened',
+            });
+          }
+          await transitionIntake(client, {
+            id: foundingIntake.id,
+            to: decision === 'approved' ? 'APPROVED' : 'DECLINED',
+            actorType: 'ops',
+            actorAccountId: req.account.id,
+            note: reasonText.slice(0, 1000),
+          });
+        }
         await client.query(
           `INSERT INTO audit_log (actor_account_id, action, target, reason, meta)
            VALUES ($1, 'founding.decide', $2, $3, $4)`,
