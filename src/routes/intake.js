@@ -259,7 +259,8 @@ export function registerIntakeRoutes(app, pool) {
   // null, canonical status mapped for display).
   app.get('/v1/me/commission-briefs', { preHandler: auth }, async (req) => {
     const { rows: mine } = await pool.query(
-      `SELECT s.*, b.title AS brief_title, b.status AS brief_status
+      `SELECT s.*, b.title AS brief_title, b.status AS brief_status,
+              b.closed_at AS brief_closed_at, b.closed_by AS brief_closed_by
          FROM intake_submissions s
          JOIN briefs b ON b.id = s.canonical_id
         WHERE s.owner_account_id = $1 AND s.type = 'brief'
@@ -279,6 +280,8 @@ export function registerIntakeRoutes(app, pool) {
       ...submissionView(r),
       title: r.brief_title,
       briefStatus: r.brief_status,
+      briefClosedAt: r.brief_closed_at || null,
+      briefClosedBy: r.brief_closed_by || null,
     }));
     for (const b of legacy) {
       briefs.push({
@@ -299,6 +302,8 @@ export function registerIntakeRoutes(app, pool) {
         legacy: true,
         title: b.title,
         briefStatus: b.status,
+        briefClosedAt: b.closed_at || null,
+        briefClosedBy: b.closed_by || null,
       });
     }
     briefs.sort((a, b) => new Date(b.receivedAt) - new Date(a.receivedAt));
@@ -530,9 +535,10 @@ export function registerIntakeRoutes(app, pool) {
     const reason = requireReason(req, reply);
     if (reason === null) return;
     return deskAct(req, reply, async (client) => {
-      const { rows: cur } = await client.query('SELECT type FROM intake_submissions WHERE id = $1', [
-        req.params.id,
-      ]);
+      const { rows: cur } = await client.query(
+        'SELECT type, canonical_id FROM intake_submissions WHERE id = $1',
+        [req.params.id],
+      );
       if (!cur.length) throw intakeError(404, 'not_found', 'Submission not found');
       if (cur[0].type === 'proposal') {
         throw intakeError(
@@ -550,6 +556,22 @@ export function registerIntakeRoutes(app, pool) {
         note: reason,
         closeReason: reason,
       });
+      // C-23 (v93): a Desk close of a brief closes the CANONICAL brief in
+      // the SAME transaction (deskAct's), so no surface can keep presenting
+      // it as open after ops closed it — the two records once disagreed
+      // (intake CLOSED, canonical brief still "open"). Only an open brief
+      // is synced: an awarded brief is a live commission order and is never
+      // retro-canceled by an intake close. The closure lands on the brief
+      // row itself (closed_at / closed_by='desk'); the intake close event
+      // above already records who/when/why.
+      if (cur[0].type === 'brief' && cur[0].canonical_id) {
+        await client.query(
+          `UPDATE briefs
+              SET status = 'canceled', closed_at = now(), closed_by = 'desk', updated_at = now()
+            WHERE id = $1 AND status = 'open'`,
+          [cur[0].canonical_id],
+        );
+      }
       return { submission: deskSubmissionView(submission) };
     });
   });
