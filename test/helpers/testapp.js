@@ -60,6 +60,7 @@ export async function buildTestApp(pool) {
   const { registerAdminRoutes } = await import('../../src/routes/admin.js');
   const { registerSoundRoutes } = await import('../../src/routes/sound.js');
   const { registerSupportRoutes } = await import('../../src/routes/support.js');
+  const { registerIntakeRoutes } = await import('../../src/routes/intake.js');
   const { registerStripeWebhook } = await import('../../src/inbox.js');
   registerArtistRoutes(app, pool);
   registerListingsRoutes(app, pool);
@@ -73,6 +74,7 @@ export async function buildTestApp(pool) {
   registerAdminRoutes(app, pool);
   registerSoundRoutes(app, pool);
   registerSupportRoutes(app, pool);
+  registerIntakeRoutes(app, pool);
   // Stripe webhooks verify against the RAW body — same encapsulated
   // string-parser scope as production (src/server.js), including the
   // remove of the inherited M7-D1 root parser before re-registering.
