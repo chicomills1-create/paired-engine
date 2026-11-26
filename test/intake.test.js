@@ -609,3 +609,125 @@ test('migration 0009 backfills founding applications as legacy records', async (
     await db.close();
   }
 });
+
+// ---------------------------------------------------------------------
+// C-23 (v93): a Desk close of a brief closes the CANONICAL brief in the
+// same transaction, so no surface can show it open afterward; both
+// customer brief views expose the same closure (date + who closed it).
+// ---------------------------------------------------------------------
+async function deskClose(id, reason = 'test close') {
+  return call(app, {
+    method: 'POST',
+    url: `/v1/admin/intake/${id}/close`,
+    as: 'deskops',
+    payload: { reason },
+  });
+}
+
+test('C-23: desk close of a brief closes the canonical brief atomically', async () => {
+  const created = await postWrapperBrief('c23buyer');
+  const brief = created.json().brief;
+  const ref = created.json().submission.reference;
+  await publishBrief(ref);
+  let board = await call(app, { method: 'GET', url: '/v1/briefs' });
+  assert.ok(board.json().briefs.some((b) => b.id === brief.id), 'published brief is on the Board before the close');
+
+  const deskRow = await deskFind(ref);
+  const closed = await deskClose(deskRow.id, 'c23 atomicity check');
+  assert.equal(closed.statusCode, 200, closed.body);
+
+  const { rows: brows } = await pool.query('SELECT * FROM briefs WHERE id = $1', [brief.id]);
+  assert.equal(brows[0].status, 'canceled', 'canonical brief closed by the desk close');
+  assert.equal(brows[0].closed_by, 'desk', 'closure attributed to the Desk');
+  assert.ok(brows[0].closed_at, 'closure date recorded on the brief row');
+  assert.equal((await intakeRow(ref)).status, 'CLOSED', 'intake record closed');
+
+  board = await call(app, { method: 'GET', url: '/v1/briefs' });
+  assert.ok(!board.json().briefs.some((b) => b.id === brief.id), 'closed brief no longer presents on the Board');
+
+  // Both customer surfaces expose the SAME closure data.
+  const mine = await call(app, { method: 'GET', url: '/v1/me/commission-briefs', as: 'c23buyer' });
+  const view = mine.json().briefs.find((b) => b.reference === ref);
+  assert.ok(view, 'brief present in the account status view');
+  assert.equal(view.briefStatus, 'canceled');
+  assert.equal(view.briefClosedBy, 'desk');
+  assert.ok(view.briefClosedAt, 'account view carries the closure date');
+  const studio = await call(app, { method: 'GET', url: '/v1/studio/buyer', as: 'c23buyer' });
+  const sBrief = studio.json().briefs.find((b) => b.id === brief.id);
+  assert.ok(sBrief, 'brief present in the Studio buyer view');
+  assert.equal(sBrief.status, 'canceled');
+  assert.equal(sBrief.closedBy, 'desk');
+  assert.ok(sBrief.closedAt, 'Studio view carries the closure date');
+});
+
+test('C-23: a closed brief refuses new proposals on both pitch paths', async () => {
+  const created = await postWrapperBrief('c23buyer2');
+  const brief = created.json().brief;
+  await publishBrief(created.json().submission.reference);
+  const deskRow = await deskFind(created.json().submission.reference);
+  const closed = await deskClose(deskRow.id, 'c23 gate check');
+  assert.equal(closed.statusCode, 200, closed.body);
+
+  await makeArtist(app, pool, 'c23artist');
+  const viaWrapper = await call(app, {
+    method: 'POST',
+    url: `/v1/commission-briefs/${brief.id}/proposals`,
+    as: 'c23artist',
+    payload: { priceCents: 10000, message: 'too late', idempotencyKey: key('c23prop') },
+  });
+  assert.equal(viaWrapper.statusCode, 404, 'wrapper proposal refused on a closed brief');
+  const viaCanonical = await call(app, {
+    method: 'POST',
+    url: `/v1/briefs/${brief.id}/pitches`,
+    as: 'c23artist',
+    payload: { priceCents: 10000, message: 'too late', idempotencyKey: key('c23pitch') },
+  });
+  assert.equal(viaCanonical.statusCode, 404, 'canonical pitch refused on a closed brief');
+});
+
+test('C-23: desk close of a non-brief touches no canonical brief', async () => {
+  const res = await submitArtist('c23artistapp');
+  const ref = res.json().submission.reference;
+  const countDeskClosed = async () => {
+    const { rows } = await pool.query(
+      "SELECT count(*)::int AS n FROM briefs WHERE status = 'canceled' AND closed_by = 'desk'",
+    );
+    return rows[0].n;
+  };
+  const before = await countDeskClosed();
+  const deskRow = await deskFind(ref);
+  const closed = await deskClose(deskRow.id, 'c23 non-brief check');
+  assert.equal(closed.statusCode, 200, closed.body);
+  assert.equal(await countDeskClosed(), before, 'no brief was closed by a non-brief desk close');
+});
+
+test('C-23: a failed canonical close rolls back the intake close', async () => {
+  const created = await postWrapperBrief('c23buyer3');
+  const ref = created.json().submission.reference;
+  await publishBrief(ref);
+  await pool.query('CREATE TABLE IF NOT EXISTS fi_flags (kind text PRIMARY KEY)');
+  await pool.query(`CREATE OR REPLACE FUNCTION fi_guard_upd() RETURNS trigger AS $fn$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM fi_flags WHERE kind = 'brief_update') THEN
+        RAISE EXCEPTION 'injected failure: brief_update';
+      END IF;
+      RETURN NEW;
+    END $fn$ LANGUAGE plpgsql`);
+  await pool.query('DROP TRIGGER IF EXISTS fi_briefs_upd ON briefs');
+  await pool.query(
+    "CREATE TRIGGER fi_briefs_upd BEFORE UPDATE ON briefs FOR EACH ROW EXECUTE FUNCTION fi_guard_upd()",
+  );
+  await pool.query("INSERT INTO fi_flags (kind) VALUES ('brief_update')");
+  try {
+    const deskRow = await deskFind(ref);
+    const res = await deskClose(deskRow.id, 'c23 rollback check');
+    assert.equal(res.statusCode, 500, 'injected failure surfaces as an error, never a silent half-close');
+  } finally {
+    await pool.query("DELETE FROM fi_flags WHERE kind = 'brief_update'");
+    await pool.query('DROP TRIGGER IF EXISTS fi_briefs_upd ON briefs');
+    await pool.query('DROP TABLE IF EXISTS fi_flags');
+  }
+  assert.equal((await intakeRow(ref)).status, 'VISIBLE', 'intake close rolled back with the canonical close');
+  const { rows } = await pool.query('SELECT status FROM briefs WHERE id = $1', [created.json().brief.id]);
+  assert.equal(rows[0].status, 'open', 'canonical brief untouched');
+});

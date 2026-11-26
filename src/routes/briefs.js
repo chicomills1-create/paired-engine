@@ -51,6 +51,8 @@ export function briefView(row, pitchCount = null) {
     category: row.category,
     deliverableType: row.deliverable_type ?? null,
     status: row.status,
+    closedAt: row.closed_at ?? null,
+    closedBy: row.closed_by ?? null,
     awardedPitchId: row.awarded_pitch_id,
     pitchCount,
     createdAt: row.created_at,
@@ -347,7 +349,7 @@ export function registerBriefsRoutes(app, pool) {
     try {
       await client.query('BEGIN');
       const { rows } = await client.query(
-        `UPDATE briefs SET status = 'canceled', updated_at = now() WHERE id = $1 RETURNING *`,
+        `UPDATE briefs SET status = 'canceled', closed_at = now(), closed_by = 'buyer', updated_at = now() WHERE id = $1 RETURNING *`,
         [brief.id],
       );
       const intake = await intakeForCanonical(client, 'briefs', brief.id);
